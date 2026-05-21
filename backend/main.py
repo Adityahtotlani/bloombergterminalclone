@@ -14,7 +14,7 @@ app = FastAPI(title="Bloomberg Terminal API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://bloomberg.adityatotlani.ch"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,17 +35,16 @@ async def rate_limited_get(url: str, params: dict = None) -> dict:
     if cache_key in cache:
         return cache[cache_key]
 
-    async with _request_lock:
-        now = time.time()
-        _request_times = [t for t in _request_times if now - t < 60]
-
-        if len(_request_times) >= 5:
+    # compute wait outside the lock so other requests aren't blocked
+    while True:
+        async with _request_lock:
+            now = time.time()
+            _request_times = [t for t in _request_times if now - t < 60]
+            if len(_request_times) < 5:
+                _request_times.append(time.time())
+                break
             wait = 60 - (now - _request_times[0]) + 0.1
-            if wait > 0:
-                await asyncio.sleep(wait)
-            _request_times = []
-
-        _request_times.append(time.time())
+        await asyncio.sleep(wait)
 
     full_params = {"apiKey": API_KEY}
     if params:
@@ -99,7 +98,7 @@ async def get_quote(ticker: str):
     last_quote = snap.get("lastQuote", {})
     min_data = snap.get("min", {})
 
-    price = last_trade.get("p") or day.get("c") or 0
+    price = last_trade.get("p") or day.get("c") or prev.get("c") or 0
     prev_close = prev.get("c") or 0
     change = round(price - prev_close, 4) if prev_close else 0
     change_pct = round((change / prev_close) * 100, 4) if prev_close else 0
@@ -109,16 +108,16 @@ async def get_quote(ticker: str):
         "price": price,
         "change": change,
         "change_pct": change_pct,
-        "open": day.get("o"),
-        "high": day.get("h"),
-        "low": day.get("l"),
-        "close": day.get("c"),
-        "volume": day.get("v"),
-        "vwap": day.get("vw"),
+        "open": day.get("o") or prev.get("o"),
+        "high": day.get("h") or prev.get("h"),
+        "low": day.get("l") or prev.get("l"),
+        "close": day.get("c") or prev.get("c"),
+        "volume": day.get("v") or prev.get("v"),
+        "vwap": day.get("vw") or prev.get("vw"),
         "bid": last_quote.get("P"),
-        "ask": last_quote.get("P"),
+        "ask": last_quote.get("a"),
         "bid_size": last_quote.get("S"),
-        "ask_size": last_quote.get("S"),
+        "ask_size": last_quote.get("s"),
         "prev_close": prev_close,
         "min_open": min_data.get("o"),
         "min_close": min_data.get("c"),
@@ -185,10 +184,15 @@ async def get_options(
     if strike_price_lte:
         params["strike_price.lte"] = strike_price_lte
 
-    data = await rate_limited_get(
-        f"{BASE_URL}/v3/snapshot/options/{ticker}",
-        params
-    )
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/v3/snapshot/options/{ticker}",
+            params
+        )
+    except HTTPException as e:
+        if e.status_code in (401, 403):
+            return {"ticker": ticker, "options": [], "error": "Options data requires a paid Polygon plan"}
+        raise
 
     results = data.get("results", [])
     options = []

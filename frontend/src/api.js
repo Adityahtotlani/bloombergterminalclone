@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const client = axios.create({ baseURL: 'http://localhost:8000' });
+const client = axios.create({ baseURL: '' });
 
 export const searchTickers = (q) => client.get('/api/search', { params: { q } });
 export const getQuote = (ticker) => client.get(`/api/quote/${ticker}`);

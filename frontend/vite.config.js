@@ -6,5 +6,9 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    allowedHosts: ['bloomberg.adityatotlani.ch'],
+    proxy: {
+      '/api': 'http://localhost:8000',
+    },
   },
 })

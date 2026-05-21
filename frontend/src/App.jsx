@@ -58,7 +58,7 @@ export default function App() {
   useEffect(() => {
     const check = async () => {
       try {
-        const res = await fetch('http://localhost:8000/api/health');
+        const res = await fetch('/api/health');
         setConnected(res.ok);
       } catch {
         setConnected(false);
