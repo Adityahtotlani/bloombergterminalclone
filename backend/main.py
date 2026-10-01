@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 import os
 import re
@@ -6,7 +7,7 @@ import time
 from typing import Optional
 from datetime import datetime, timedelta
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from cachetools import TTLCache
@@ -21,7 +22,17 @@ if not API_KEY:
     logger.warning("POLYGON_API_KEY is not set — copy backend/.env.example to backend/.env")
 BASE_URL = "https://api.polygon.io"
 
-app = FastAPI(title="Bloomberg Terminal API")
+# The current HTTP request, so the rate limiter can drop queued work whose client went away.
+_current_request: contextvars.ContextVar[Optional[Request]] = contextvars.ContextVar(
+    "current_request", default=None
+)
+
+
+async def _track_request(request: Request):
+    _current_request.set(request)
+
+
+app = FastAPI(title="Bloomberg Terminal API", dependencies=[Depends(_track_request)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,13 +43,24 @@ app.add_middleware(
 )
 
 cache = TTLCache(maxsize=512, ttl=10)  # 10s TTL for near-real-time data
+# Longer-lived caches for data that changes slowly; keyed by TTL in seconds.
+_ttl_caches: dict[int, TTLCache] = {10: cache}
+
+
+def _cache_for(ttl: int) -> TTLCache:
+    if ttl not in _ttl_caches:
+        _ttl_caches[ttl] = TTLCache(maxsize=512, ttl=ttl)
+    return _ttl_caches[ttl]
+
+
+# Give up (503) rather than leave a panel spinning when the rate-limit queue is long.
+MAX_QUEUE_WAIT = 75
 # End-of-day data only changes once per session, so hold it much longer.
 eod_cache = TTLCache(maxsize=1024, ttl=600)
 
 # Requests per minute allowed by the Polygon plan (free: 5, Starter+: effectively unlimited).
 RATE_LIMIT = int(os.getenv("POLYGON_RATE_LIMIT", "5"))
 _request_times: list[float] = []
-_request_lock = asyncio.Lock()
 
 # Endpoint families the current key isn't entitled to (403) or that are gone (410).
 # Remembered so we don't burn scarce rate-limit slots re-discovering the denial.
@@ -47,12 +69,86 @@ DENIAL_TTL = {403: 30 * 60, 410: 5 * 60}
 _denied: dict[str, tuple[float, int, str]] = {}
 
 
-async def rate_limited_get(url: str, params: dict = None, family: Optional[str] = None) -> dict:
-    global _request_times
+# FIFO ticket queue: requests get upstream slots in arrival order, and a request whose
+# client disconnected (e.g. the user switched tickers) gives up its place.
+_slot_cond = asyncio.Condition()
+_ticket_next = 0
+_ticket_serving = 0
+_abandoned: set[int] = set()
 
+
+def _advance_queue() -> None:
+    global _ticket_serving
+    _ticket_serving += 1
+    while _ticket_serving in _abandoned:
+        _abandoned.discard(_ticket_serving)
+        _ticket_serving += 1
+    _slot_cond.notify_all()
+
+
+async def _acquire_slot(should_abandon=None, label: str = "") -> None:
+    """Wait (FIFO) for an upstream slot. `should_abandon` is an async predicate polled while queued."""
+    global _ticket_next, _request_times
+    deadline = time.time() + MAX_QUEUE_WAIT
+    async with _slot_cond:
+        ticket = _ticket_next
+        _ticket_next += 1
+        try:
+            while True:
+                now = time.time()
+                head = ticket == _ticket_serving
+                wait = 1.0
+                if head:
+                    _request_times = [t for t in _request_times if now - t < 60]
+                    if len(_request_times) < RATE_LIMIT:
+                        _request_times.append(now)
+                        _advance_queue()
+                        return
+                    wait = 60 - (now - _request_times[0]) + 0.05
+                if (now + wait if head else now) > deadline:
+                    raise HTTPException(status_code=503, detail="Data provider rate limit busy — retry shortly")
+                if should_abandon is not None and await should_abandon():
+                    logger.warning("Dropped queued upstream call %s: all clients disconnected", label)
+                    raise HTTPException(status_code=499, detail="Client disconnected")
+                try:
+                    await asyncio.wait_for(_slot_cond.wait(), timeout=min(wait, 1.0))
+                except asyncio.TimeoutError:
+                    pass
+        except BaseException:
+            if ticket == _ticket_serving:
+                _advance_queue()
+            else:
+                _abandoned.add(ticket)
+            raise
+
+
+class _Inflight:
+    """One shared upstream call plus the HTTP requests waiting on it."""
+
+    def __init__(self) -> None:
+        self.requests: list[Optional[Request]] = []
+        self.task: Optional[asyncio.Task] = None
+
+    async def all_clients_gone(self) -> bool:
+        if not self.requests or any(r is None for r in self.requests):
+            return False  # internal callers (no HTTP request) always want the result
+        for r in self.requests:
+            if not await r.is_disconnected():
+                return False
+        return True
+
+
+# Identical upstream calls in flight are coalesced, so e.g. 2s quote polls can't flood the queue.
+_inflight: dict[str, _Inflight] = {}
+
+
+async def rate_limited_get(
+    url: str, params: dict = None, family: Optional[str] = None, ttl: int = 10
+) -> dict:
+    store = _cache_for(ttl)
     cache_key = url + str(sorted((params or {}).items()))
-    if cache_key in cache:
-        return cache[cache_key]
+    if cache_key in store:
+        return store[cache_key]
 
     if family and family in _denied:
         until, status, detail = _denied[family]
@@ -60,33 +156,52 @@ async def rate_limited_get(url: str, params: dict = None, family: Optional[str] 
             raise HTTPException(status_code=status, detail=detail)
         del _denied[family]
 
-    while True:
-        async with _request_lock:
-            now = time.time()
-            _request_times = [t for t in _request_times if now - t < 60]
-            if len(_request_times) < RATE_LIMIT:
-                _request_times.append(time.time())
-                break
-            wait = 60 - (now - _request_times[0]) + 0.1
-        await asyncio.sleep(wait)
+    flight = _inflight.get(cache_key)
+    if flight is None:
+        flight = _Inflight()
+        _inflight[cache_key] = flight
+        # Fresh context: the shared task must not belong to whichever request started it.
+        flight.task = asyncio.create_task(
+            _fetch_upstream(url, params, family, store, cache_key, flight),
+            context=contextvars.Context(),
+        )
+        flight.task.add_done_callback(
+            lambda _t, k=cache_key, f=flight: _inflight.pop(k) if _inflight.get(k) is f else None
+        )
+    flight.requests.append(_current_request.get())
+    return await asyncio.shield(flight.task)
 
-    full_params = {"apiKey": API_KEY}
-    if params:
-        full_params.update(params)
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, params=full_params)
-        if resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded, retry after 60s")
-        if resp.status_code != 200:
-            if family and resp.status_code in (403, 410):
-                ttl = DENIAL_TTL[resp.status_code]
-                _denied[family] = (time.time() + ttl, resp.status_code, resp.text)
-                logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, ttl)
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        data = resp.json()
+async def _fetch_upstream(
+    url: str, params: Optional[dict], family: Optional[str],
+    store: TTLCache, cache_key: str, flight: _Inflight,
+) -> dict:
+    global _request_times
+    full_params = {"apiKey": API_KEY, **(params or {})}
+    label = url.replace(BASE_URL, "")
 
-    cache[cache_key] = data
+    for attempt in range(2):
+        await _acquire_slot(flight.all_clients_gone, label)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=full_params)
+        if resp.status_code == 429 and attempt == 0:
+            # Polygon's window is fuller than our count (e.g. after a restart): treat it as full.
+            logger.warning("Polygon returned 429 for %s; backing off", label)
+            _request_times = [time.time()] * RATE_LIMIT
+            continue
+        break
+
+    if resp.status_code == 429:
+        raise HTTPException(status_code=503, detail="Data provider rate limit busy — retry shortly")
+    if resp.status_code != 200:
+        if family and resp.status_code in (403, 410):
+            denial_ttl = DENIAL_TTL[resp.status_code]
+            _denied[family] = (time.time() + denial_ttl, resp.status_code, resp.text)
+            logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json()
+    store[cache_key] = data
     return data
 
 
@@ -105,7 +220,8 @@ async def health():
 async def search_tickers(q: str = Query(..., min_length=1)):
     data = await rate_limited_get(
         f"{BASE_URL}/v3/reference/tickers",
-        {"search": q, "active": "true", "limit": 10, "market": "stocks"}
+        {"search": q, "active": "true", "limit": 10, "market": "stocks"},
+        ttl=3600,
     )
     results = [
         {
@@ -187,11 +303,16 @@ async def _recent_daily_bars(ticker: str) -> list[dict]:
         f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
         f"{(today - timedelta(days=10)).strftime('%Y-%m-%d')}/{today.strftime('%Y-%m-%d')}",
         {"adjusted": "true", "sort": "asc", "limit": 50},
+        ttl=600,
     )
     return data.get("results") or []
 
 
 async def _eod_single_quote(ticker: str) -> dict:
+    # The whole-market table (built for the watchlist) already has this ticker — free lookup.
+    market = eod_cache.get("market")
+    if market and ticker in market:
+        return market[ticker]
     key = ("quote", ticker)
     if key in eod_cache:
         return eod_cache[key]
@@ -218,7 +339,7 @@ async def _eod_market() -> dict[str, dict]:
 
     async def grouped(day: str) -> list[dict]:
         data = await rate_limited_get(
-            f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"}
+            f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"}, ttl=600
         )
         return data.get("results") or []
 
@@ -340,7 +461,8 @@ async def get_aggs(
 
     data = await rate_limited_get(
         f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/{mult}/{tspan}/{from_str}/{to_str}",
-        {"adjusted": "true", "sort": "asc", "limit": 5000}
+        {"adjusted": "true", "sort": "asc", "limit": 5000},
+        ttl=60 if tspan == "minute" else 600,
     )
 
     bars = [
@@ -377,6 +499,7 @@ async def get_options(
             f"{BASE_URL}/v3/snapshot/options/{ticker}",
             params,
             family="options",
+            ttl=60,
         )
     except HTTPException as e:
         if _is_denied(e):
@@ -413,7 +536,8 @@ async def get_news(ticker: str, limit: int = Query(10)):
     ticker = ticker.upper()
     data = await rate_limited_get(
         f"{BASE_URL}/v2/reference/news",
-        {"ticker": ticker, "limit": limit, "order": "desc", "sort": "published_utc"}
+        {"ticker": ticker, "limit": limit, "order": "desc", "sort": "published_utc"},
+        ttl=300,
     )
     news = [
         {
@@ -437,14 +561,16 @@ async def get_financials(ticker: str):
     try:
         data = await rate_limited_get(
             f"{BASE_URL}/vX/reference/financials",
-            {"ticker": ticker, "limit": 4, "sort": "filing_date", "order": "desc"},
+            # Same params as /api/earnings so both panels share one upstream request.
+            {"ticker": ticker, "limit": 8, "sort": "filing_date", "order": "desc"},
             family="financials",
+            ttl=3600,
         )
     except HTTPException as e:
         if _is_denied(e):
             return {"ticker": ticker, "financials": [], "error": "Financials unavailable on current Polygon plan"}
         raise
-    results = data.get("results", [])
+    results = data.get("results", [])[:4]
     if not results:
         return {"ticker": ticker, "financials": []}
 
@@ -486,6 +612,7 @@ async def get_earnings(ticker: str):
             f"{BASE_URL}/vX/reference/financials",
             {"ticker": ticker, "limit": 8, "sort": "filing_date", "order": "desc"},
             family="financials",
+            ttl=3600,
         )
     except HTTPException as e:
         if _is_denied(e):
@@ -594,7 +721,7 @@ async def get_economic_events():
 async def get_ticker_details(ticker: str):
     ticker = ticker.upper()
     data = await rate_limited_get(
-        f"{BASE_URL}/v3/reference/tickers/{ticker}"
+        f"{BASE_URL}/v3/reference/tickers/{ticker}", ttl=3600
     )
     r = data.get("results", {})
     return {

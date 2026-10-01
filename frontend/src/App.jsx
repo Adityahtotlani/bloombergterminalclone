@@ -10,6 +10,21 @@ import MonitorPanel from './components/MonitorPanel';
 import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails, getEarnings, getEconomicEvents } from './api';
 import './App.css';
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** Retry while the backend's rate-limit queue is full (503) — the panel stays in LOADING. */
+async function withBusyRetry(fn, signal, attempts = 4) {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (signal?.aborted || e?.response?.status !== 503 || i >= attempts - 1) throw e;
+      await sleep(3000);
+      if (signal?.aborted) throw e;
+    }
+  }
+}
+
 function PanelHeader({ label }) {
   return (
     <div style={{
@@ -46,6 +61,7 @@ export default function App() {
   const [news, setNews] = useState(null);
   const [financials, setFinancials] = useState(null);
   const [timeframe, setTimeframe] = useState('1M');
+  const timeframeRef = useRef('1M');
   const [connected, setConnected] = useState(false);
 
   const [loadingQuote, setLoadingQuote] = useState(false);
@@ -57,9 +73,14 @@ export default function App() {
   const [macroEvents, setMacroEvents] = useState(null);
   const [loadingEarnings, setLoadingEarnings] = useState(false);
   const [loadingMacro, setLoadingMacro] = useState(false);
+  // Per-panel error/notice text shown instead of an empty panel.
+  const [panelErrors, setPanelErrors] = useState({});
 
   const intervalRef = useRef(null);
   const currentTicker = useRef('');
+  // Aborts the previous ticker's in-flight requests so they stop holding rate-limit slots.
+  const tickerAbort = useRef(null);
+  const quotePending = useRef(false);
 
   useEffect(() => {
     const check = async () => {
@@ -109,61 +130,46 @@ export default function App() {
     }
   }, []);
 
-  const loadChart = useCallback(async (t, tf) => {
+  const loadChart = useCallback(async (t, tf, signal) => {
     setLoadingChart(true);
     try {
-      const res = await getAggs(t, tf);
-      setBars(res.data.bars);
+      const res = await withBusyRetry(() => getAggs(t, tf, { signal }), signal);
+      if (currentTicker.current === t) setBars(res.data.bars);
     } catch (e) {
-      console.error('Chart error:', e);
+      if (!signal?.aborted) console.error('Chart error:', e);
     } finally {
-      setLoadingChart(false);
+      if (currentTicker.current === t) setLoadingChart(false);
     }
   }, []);
 
-  const loadStaticData = useCallback(async (t) => {
-    setLoadingOptions(true);
-    setLoadingNews(true);
-    setLoadingFinancials(true);
-    setLoadingEarnings(true);
-
-    try {
-      const r = await getTickerDetails(t);
-      setDetails(r.data);
-    } catch (e) { console.error('Details error:', e); }
-
-    await new Promise(r => setTimeout(r, 600));
-
-    try {
-      const r = await getNews(t);
-      setNews(r.data.news);
-    } catch (e) { console.error('News error:', e); }
-    finally { setLoadingNews(false); }
-
-    await new Promise(r => setTimeout(r, 600));
-
-    try {
-      const r = await getFinancials(t);
-      setFinancials(r.data.financials);
-    } catch (e) { console.error('Financials error:', e); }
-    finally { setLoadingFinancials(false); }
-
-    await new Promise(r => setTimeout(r, 600));
-
-    try {
-      const r = await getOptions(t);
-      setOptions(r.data.options);
-    } catch (e) { console.error('Options error:', e); }
-    finally { setLoadingOptions(false); }
-
-    await new Promise(r => setTimeout(r, 400));
-
-    try {
-      const r = await getEarnings(t);
-      setEarnings(r.data.earnings);
-    } catch (e) { console.error('Earnings error:', e); }
-    finally { setLoadingEarnings(false); }
-  }, []);
+  const loadStaticData = useCallback((t, signal) => {
+    setPanelErrors({});
+    // Fire everything at once — the backend's rate limiter does the pacing. News first so
+    // it gets the earliest slot. Results for a ticker the user has moved away from are dropped.
+    const load = (name, fetcher, onData, setLoading) => {
+      if (setLoading) setLoading(true);
+      withBusyRetry(() => fetcher(t, { signal }), signal)
+        .then((r) => {
+          if (currentTicker.current !== t) return;
+          onData(r.data);
+          if (r.data?.error) setPanelErrors(p => ({ ...p, [name]: r.data.error }));
+        })
+        .catch((e) => {
+          if (signal.aborted || currentTicker.current !== t) return;
+          console.error(`${name} error:`, e);
+          setPanelErrors(p => ({ ...p, [name]: e?.response?.data?.detail || 'REQUEST FAILED' }));
+        })
+        .finally(() => {
+          if (setLoading && currentTicker.current === t) setLoading(false);
+        });
+    };
+    load('news', getNews, d => setNews(d.news), setLoadingNews);
+    loadChart(t, timeframeRef.current, signal);
+    load('details', getTickerDetails, d => setDetails(d));
+    load('financials', getFinancials, d => setFinancials(d.financials), setLoadingFinancials);
+    load('options', getOptions, d => setOptions(d.options), setLoadingOptions);
+    load('earnings', getEarnings, d => setEarnings(d.earnings), setLoadingEarnings);
+  }, [loadChart]);
 
   const handleTickerSelect = useCallback(async (t) => {
     if (!t) return;
@@ -174,24 +180,32 @@ export default function App() {
     setQuote(null); setDetails(null); setBars(null);
     setOptions(null); setNews(null); setFinancials(null); setEarnings(null);
 
+    tickerAbort.current?.abort();
+    const controller = new AbortController();
+    tickerAbort.current = controller;
+
+    // Kick off the slower panels immediately rather than after the quote arrives.
+    loadStaticData(t, controller.signal);
+
     setLoadingQuote(true);
     try {
       await loadQuote(t);
     } finally {
-      setLoadingQuote(false);
+      if (currentTicker.current === t) setLoadingQuote(false);
     }
 
-    loadChart(t, timeframe);
-    loadStaticData(t);
-
     if (intervalRef.current) clearInterval(intervalRef.current);
-    intervalRef.current = setInterval(() => {
-      if (currentTicker.current) loadQuote(currentTicker.current);
+    intervalRef.current = setInterval(async () => {
+      // Skip this tick if the previous poll is still pending, so slow responses can't pile up.
+      if (!currentTicker.current || quotePending.current) return;
+      quotePending.current = true;
+      try { await loadQuote(currentTicker.current); } finally { quotePending.current = false; }
     }, 2000);
-  }, [loadQuote, loadChart, loadStaticData, timeframe]);
+  }, [loadQuote, loadStaticData]);
 
   const handleTimeframeChange = useCallback((tf) => {
     setTimeframe(tf);
+    timeframeRef.current = tf;
     if (ticker) loadChart(ticker, tf);
   }, [ticker, loadChart]);
 
@@ -228,21 +242,21 @@ export default function App() {
             <Panel style={{ flex: '0 0 28%' }}>
               <PanelHeader label="OPTIONS CHAIN" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
-                <OptionsPanel options={options} loading={loadingOptions} />
+                <OptionsPanel options={options} loading={loadingOptions} error={panelErrors.options} />
               </div>
             </Panel>
 
             <Panel style={{ flex: '0 0 24%' }}>
               <PanelHeader label="NEWS FEED" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
-                <NewsPanel news={news} loading={loadingNews} />
+                <NewsPanel news={news} loading={loadingNews} error={panelErrors.news} />
               </div>
             </Panel>
 
             <Panel style={{ flex: '0 0 24%' }}>
               <PanelHeader label="FUNDAMENTALS" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
-                <FinancialsPanel financials={financials} loading={loadingFinancials} />
+                <FinancialsPanel financials={financials} loading={loadingFinancials} error={panelErrors.financials} />
               </div>
             </Panel>
 

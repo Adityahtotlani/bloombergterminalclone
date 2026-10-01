@@ -30,7 +30,7 @@ function TD({ children, color, align = 'right' }) {
   );
 }
 
-export default function OptionsPanel({ options, loading }) {
+export default function OptionsPanel({ options, loading, error }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)' }}>
       LOADING OPTIONS...
@@ -39,7 +39,7 @@ export default function OptionsPanel({ options, loading }) {
 
   if (!options || options.length === 0) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
-      NO OPTIONS DATA
+      {error ? <span style={{ color: 'var(--amber-dim)', textAlign: 'center', padding: '0 12px', textTransform: 'uppercase' }}>{error}</span> : 'NO OPTIONS DATA'}
     </div>
   );
 

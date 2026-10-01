@@ -44,6 +44,8 @@ export default function TopBar({ onTickerSelect, connected }) {
   const [suggestions, setSuggestions] = useState([]);
   const [open, setOpen] = useState(false);
   const debounceRef = useRef(null);
+  // Search results rarely change; caching them saves scarce API requests.
+  const searchCache = useRef(new Map());
   const inputRef = useRef(null);
 
   useEffect(() => {
@@ -61,16 +63,24 @@ export default function TopBar({ onTickerSelect, connected }) {
     setInput(val);
     clearTimeout(debounceRef.current);
     if (val.length < 1) { setSuggestions([]); setOpen(false); return; }
+    if (searchCache.current.has(val)) {
+      setSuggestions(searchCache.current.get(val));
+      setOpen(true);
+      return;
+    }
     debounceRef.current = setTimeout(async () => {
       try {
         const res = await searchTickers(val);
-        setSuggestions(res.data.results || []);
+        const results = res.data.results || [];
+        searchCache.current.set(val, results);
+        setSuggestions(results);
         setOpen(true);
       } catch { setSuggestions([]); }
-    }, 300);
+    }, 500);
   };
 
   const select = (ticker) => {
+    clearTimeout(debounceRef.current); // don't fire a stale search after choosing
     setInput(ticker);
     setOpen(false);
     setSuggestions([]);

@@ -35,7 +35,7 @@ function MetricRow({ label, values, format = fmtM, colorFn }) {
 
 const posNegColor = (v) => v == null ? 'var(--text-dim)' : v >= 0 ? 'var(--green)' : 'var(--red)';
 
-export default function FinancialsPanel({ financials, loading }) {
+export default function FinancialsPanel({ financials, loading, error }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)' }}>
       LOADING FINANCIALS...
@@ -44,7 +44,7 @@ export default function FinancialsPanel({ financials, loading }) {
 
   if (!financials || financials.length === 0) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
-      NO FINANCIAL DATA
+      {error ? <span style={{ color: 'var(--amber-dim)', textAlign: 'center', padding: '0 12px', textTransform: 'uppercase' }}>{error}</span> : 'NO FINANCIAL DATA'}
     </div>
   );
 

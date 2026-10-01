@@ -1,4 +1,4 @@
-export default function NewsPanel({ news, loading }) {
+export default function NewsPanel({ news, loading, error }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)' }}>
       LOADING NEWS...
@@ -7,7 +7,7 @@ export default function NewsPanel({ news, loading }) {
 
   if (!news || news.length === 0) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
-      NO NEWS DATA
+      {error ? <span style={{ color: 'var(--amber-dim)', textAlign: 'center', padding: '0 12px', textTransform: 'uppercase' }}>{error}</span> : 'NO NEWS DATA'}
     </div>
   );
 
