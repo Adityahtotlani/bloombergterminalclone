@@ -637,6 +637,36 @@ async def get_earnings(ticker: str):
     return {"ticker": ticker, "earnings": earnings}
 
 
+def _months_after(iso_date: str, count: int):
+    """Yield (year, month) for the `count` months following the month of `iso_date`."""
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    for offset in range(1, count + 1):
+        index = d.month - 1 + offset
+        yield d.year + index // 12, index % 12 + 1
+
+
+def _last_weekday(year: int, month: int, weekday: int):
+    """Date of the last given weekday (Mon=0) in a month."""
+    next_month = datetime(year + month // 12, month % 12 + 1, 1).date()
+    last = next_month - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _nfp_release_estimate(year: int, month: int):
+    """BLS rule: the third Friday after the survey week (the Sun-Sat week containing the 12th
+    of the previous month), adjusted for New Year's and Independence Day. Reproduces 11/13 of
+    the official 2026 schedule; the misses were one-off reschedulings."""
+    ref_year, ref_month = (year, month - 1) if month > 1 else (year - 1, 12)
+    twelfth = datetime(ref_year, ref_month, 12).date()
+    survey_week_end = twelfth + timedelta(days=(5 - twelfth.weekday()) % 7)  # Saturday
+    release = survey_week_end + timedelta(days=20)  # third Friday after
+    if release.month == 1 and release.day <= 2:
+        release += timedelta(days=7)
+    elif (release.month, release.day) in ((7, 3), (7, 4)):
+        release -= timedelta(days=1)
+    return release
+
+
 def _macro_events():
     """Generate known macro events for the next 12 months from today."""
     today = datetime.utcnow().date()
@@ -675,47 +705,50 @@ def _macro_events():
     for d in cpi_dates:
         events.append({"date": d, "event": "CPI Inflation Report", "category": "ECON", "importance": "HIGH"})
 
-    last_cpi = datetime.strptime(cpi_dates[-1], "%Y-%m-%d").date()
-    for month_offset in range(1, 13):
-        month_index = last_cpi.month - 1 + month_offset
-        year, month = last_cpi.year + month_index // 12, month_index % 12 + 1
+    for year, month in _months_after(cpi_dates[-1], 12):
         est = datetime(year, month, 13).date()
         while est.weekday() in (0, 5, 6):  # BLS releases Tue-Fri (Mondays are often holidays)
             est += timedelta(days=1)
         events.append({"date": str(est), "event": "CPI Inflation Report (est.)", "category": "ECON",
                        "importance": "HIGH", "estimated": True})
 
-    # NFP — first Friday of each month
-    for month_offset in range(-3, 9):
-        ref = today.replace(day=1)
-        year = ref.year
-        month = ref.month + month_offset
-        while month > 12:
-            month -= 12
-            year += 1
-        while month < 1:
-            month += 12
-            year -= 1
-        try:
-            first = datetime(year, month, 1).date()
-            # Find first Friday
-            days_ahead = 4 - first.weekday()
-            if days_ahead < 0:
-                days_ahead += 7
-            nfp_date = first + timedelta(days=days_ahead)
-            events.append({"date": str(nfp_date), "event": "Non-Farm Payrolls", "category": "ECON", "importance": "HIGH"})
-        except ValueError:
-            pass
+    # Non-Farm Payrolls (Employment Situation) — official BLS schedule
+    # (https://www.bls.gov/schedule/news_release/empsit.htm), 8:30 AM ET.
+    nfp_dates = [
+        "2025-12-16",
+        "2026-01-09", "2026-02-11", "2026-03-06", "2026-04-03", "2026-05-08", "2026-06-05",
+        "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04",
+    ]
+    for d in nfp_dates:
+        events.append({"date": d, "event": "Non-Farm Payrolls", "category": "ECON", "importance": "HIGH"})
+    for year, month in _months_after(nfp_dates[-1], 12):
+        est = _nfp_release_estimate(year, month)
+        events.append({"date": str(est), "event": "Non-Farm Payrolls (est.)", "category": "ECON",
+                       "importance": "HIGH", "estimated": True})
 
-    # GDP releases (approx end of Jan, Apr, Jul, Oct)
-    gdp_months = [1, 4, 7, 10]
-    for year in [today.year, today.year + 1]:
-        for m in gdp_months:
-            try:
-                dt = datetime(year, m, 30).date()
-                events.append({"date": str(dt), "event": "GDP Growth Rate", "category": "ECON", "importance": "MED"})
-            except ValueError:
-                pass
+    # GDP — official BEA schedule (https://www.bea.gov/news/schedule/full), 8:30 AM ET.
+    # The advance estimate moves markets; the second/third revisions matter less.
+    gdp_releases = [
+        ("2026-01-22", "Updated", "Q3 2025"),
+        ("2026-02-20", "Advance", "Q4 2025"), ("2026-03-13", "Second", "Q4 2025"),
+        ("2026-04-09", "Third", "Q4 2025"),
+        ("2026-04-30", "Advance", "Q1 2026"), ("2026-05-28", "Second", "Q1 2026"),
+        ("2026-06-25", "Third", "Q1 2026"),
+        ("2026-07-30", "Advance", "Q2 2026"), ("2026-08-26", "Second", "Q2 2026"),
+        ("2026-09-30", "Third", "Q2 2026"),
+        ("2026-10-29", "Advance", "Q3 2026"), ("2026-11-25", "Second", "Q3 2026"),
+        ("2026-12-23", "Third", "Q3 2026"),
+    ]
+    for d, stage, quarter in gdp_releases:
+        events.append({"date": d, "event": f"GDP {stage} Estimate {quarter}", "category": "ECON",
+                       "importance": "HIGH" if stage == "Advance" else "MED"})
+    # Beyond the published schedule, estimate only the advance releases (late Jan/Apr/Jul/Oct).
+    for year, month in _months_after(gdp_releases[-1][0], 12):
+        if month in (1, 4, 7, 10):
+            est = _last_weekday(year, month, weekday=3)  # usually the last Thursday
+            quarter = f"Q{(month // 3) or 4} {year - 1 if month == 1 else year}"
+            events.append({"date": str(est), "event": f"GDP Advance Estimate {quarter} (est.)",
+                           "category": "ECON", "importance": "HIGH", "estimated": True})
 
     events.sort(key=lambda x: x["date"])
     # Keep events within ±6 months
