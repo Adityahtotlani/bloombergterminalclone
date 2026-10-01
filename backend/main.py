@@ -664,24 +664,26 @@ def _macro_events():
                 "importance": "HIGH",
             })
 
-    # CPI releases (approx 2nd Wed of each month, but use known schedule)
-    # Approximate: 13th-15th of each month
-    for month_offset in range(-3, 9):
-        ref = today.replace(day=1)
-        year = ref.year
-        month = ref.month + month_offset
-        while month > 12:
-            month -= 12
-            year += 1
-        while month < 1:
-            month += 12
-            year -= 1
-        approx_day = min(14, 28)
-        try:
-            dt = datetime(year, month, approx_day).date()
-            events.append({"date": str(dt), "event": "CPI Inflation Report", "category": "ECON", "importance": "HIGH"})
-        except ValueError:
-            pass
+    # CPI releases — official BLS schedule (https://www.bls.gov/schedule/news_release/cpi.htm),
+    # 8:30 AM ET. Months past the last published date get a clearly-labelled estimate.
+    # Add the next year's dates when BLS publishes them (usually late in the year).
+    cpi_dates = [
+        "2025-12-18",
+        "2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12", "2026-06-10",
+        "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10",
+    ]
+    for d in cpi_dates:
+        events.append({"date": d, "event": "CPI Inflation Report", "category": "ECON", "importance": "HIGH"})
+
+    last_cpi = datetime.strptime(cpi_dates[-1], "%Y-%m-%d").date()
+    for month_offset in range(1, 13):
+        month_index = last_cpi.month - 1 + month_offset
+        year, month = last_cpi.year + month_index // 12, month_index % 12 + 1
+        est = datetime(year, month, 13).date()
+        while est.weekday() in (0, 5, 6):  # BLS releases Tue-Fri (Mondays are often holidays)
+            est += timedelta(days=1)
+        events.append({"date": str(est), "event": "CPI Inflation Report (est.)", "category": "ECON",
+                       "importance": "HIGH", "estimated": True})
 
     # NFP — first Friday of each month
     for month_offset in range(-3, 9):
