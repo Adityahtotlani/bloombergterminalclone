@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from cachetools import TTLCache
 from dotenv import load_dotenv
 
@@ -87,6 +88,12 @@ async def rate_limited_get(url: str, params: dict = None, family: Optional[str] 
 
     cache[cache_key] = data
     return data
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Send visitors of the bare API domain to the interactive docs."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/api/health")
