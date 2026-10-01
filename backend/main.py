@@ -642,17 +642,27 @@ def _macro_events():
     today = datetime.utcnow().date()
     events = []
 
-    # FOMC meetings 2025-2026 (scheduled dates)
-    fomc_dates = [
-        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
-        "2025-07-30", "2025-09-17", "2025-11-05", "2025-12-17",
-        "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
-        "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16",
-    ]
-    for d in fomc_dates:
+    # FOMC rate decisions (second day of each meeting), from
+    # https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm — True = meeting includes
+    # the Summary of Economic Projections (SEP). Dates are tentative until the prior meeting
+    # confirms them; refresh this list when the Fed publishes the next year's schedule.
+    fomc_dates = {
+        "2025-01-29": False, "2025-03-19": True, "2025-05-07": False, "2025-06-18": True,
+        "2025-07-30": False, "2025-09-17": True, "2025-10-29": False, "2025-12-10": True,
+        "2026-01-28": False, "2026-03-18": True, "2026-04-29": False, "2026-06-17": True,
+        "2026-07-29": False, "2026-09-16": True, "2026-10-28": False, "2026-12-09": True,
+        "2027-01-27": False, "2027-03-17": True, "2027-04-28": False, "2027-06-09": True,
+        "2027-07-28": False, "2027-09-15": True, "2027-10-27": False, "2027-12-08": True,
+    }
+    for d, has_sep in fomc_dates.items():
         dt = datetime.strptime(d, "%Y-%m-%d").date()
         if abs((dt - today).days) <= 180:
-            events.append({"date": d, "event": "FOMC Rate Decision", "category": "FED", "importance": "HIGH"})
+            events.append({
+                "date": d,
+                "event": "FOMC Rate Decision + SEP" if has_sep else "FOMC Rate Decision",
+                "category": "FED",
+                "importance": "HIGH",
+            })
 
     # CPI releases (approx 2nd Wed of each month, but use known schedule)
     # Approximate: 13th-15th of each month
