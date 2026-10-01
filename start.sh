@@ -15,6 +15,11 @@ fi
 source .venv/bin/activate
 pip install -q -r requirements.txt
 deactivate
+if [ ! -f ".env" ]; then
+  cp .env.example .env
+  echo "  !! Created backend/.env — set POLYGON_API_KEY in it, then re-run."
+  exit 1
+fi
 
 # --- Frontend setup ---
 echo "[2/4] Setting up Node frontend..."

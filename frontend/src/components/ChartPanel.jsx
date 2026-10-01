@@ -107,13 +107,6 @@ export default function ChartPanel({ bars, timeframe, onTimeframeChange, loading
   }, [bars]);
 
   const fmt = (n, d = 2) => n != null ? Number(n).toFixed(d) : '---';
-  const fmtVol = (n) => {
-    if (n == null) return '---';
-    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return n.toString();
-  };
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>

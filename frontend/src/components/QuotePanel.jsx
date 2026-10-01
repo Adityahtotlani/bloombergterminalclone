@@ -80,6 +80,14 @@ export default function QuotePanel({ quote, details, loading }) {
         <div style={{ textAlign: 'right', fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
           PREV CLOSE {fmt(quote.prev_close)}
         </div>
+        {quote.source === 'eod' && (
+          <div
+            title="Live snapshots aren't included in the current Polygon plan — showing last session close"
+            style={{ textAlign: 'right', fontSize: '9px', color: 'var(--amber-dim)', marginTop: '2px', letterSpacing: '1px' }}
+          >
+            EOD · DELAYED
+          </div>
+        )}
       </div>
 
       <Divider label="QUOTE" />

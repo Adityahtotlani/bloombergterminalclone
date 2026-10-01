@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import os
+import re
 import time
 from typing import Optional
 from datetime import datetime, timedelta
@@ -6,8 +9,15 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
+from dotenv import load_dotenv
 
-API_KEY = "iQvdjdDI6r6tbFj_TqI_cv496Ibf59TJ"
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+logger = logging.getLogger("bbg")
+
+API_KEY = os.getenv("POLYGON_API_KEY", "")
+if not API_KEY:
+    logger.warning("POLYGON_API_KEY is not set — copy backend/.env.example to backend/.env")
 BASE_URL = "https://api.polygon.io"
 
 app = FastAPI(title="Bloomberg Terminal API")
@@ -20,27 +30,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 60s TTL cache, max 256 entries
-cache = TTLCache(maxsize=256, ttl=60)
+cache = TTLCache(maxsize=512, ttl=10)  # 10s TTL for near-real-time data
+# End-of-day data only changes once per session, so hold it much longer.
+eod_cache = TTLCache(maxsize=1024, ttl=600)
 
-# Simple rate limiter: 5 requests per 60s for free tier
+# Requests per minute allowed by the Polygon plan (free: 5, Starter+: effectively unlimited).
+RATE_LIMIT = int(os.getenv("POLYGON_RATE_LIMIT", "5"))
 _request_times: list[float] = []
 _request_lock = asyncio.Lock()
 
+# Endpoint families the current key isn't entitled to (403) or that are gone (410).
+# Remembered so we don't burn scarce rate-limit slots re-discovering the denial.
+# 403 = plan entitlement (stable); 410 = deprecation brownout (intermittent, retry sooner).
+DENIAL_TTL = {403: 30 * 60, 410: 5 * 60}
+_denied: dict[str, tuple[float, int, str]] = {}
 
-async def rate_limited_get(url: str, params: dict = None) -> dict:
+
+async def rate_limited_get(url: str, params: dict = None, family: Optional[str] = None) -> dict:
     global _request_times
 
     cache_key = url + str(sorted((params or {}).items()))
     if cache_key in cache:
         return cache[cache_key]
 
-    # compute wait outside the lock so other requests aren't blocked
+    if family and family in _denied:
+        until, status, detail = _denied[family]
+        if time.time() < until:
+            raise HTTPException(status_code=status, detail=detail)
+        del _denied[family]
+
     while True:
         async with _request_lock:
             now = time.time()
             _request_times = [t for t in _request_times if now - t < 60]
-            if len(_request_times) < 5:
+            if len(_request_times) < RATE_LIMIT:
                 _request_times.append(time.time())
                 break
             wait = 60 - (now - _request_times[0]) + 0.1
@@ -55,6 +78,10 @@ async def rate_limited_get(url: str, params: dict = None) -> dict:
         if resp.status_code == 429:
             raise HTTPException(status_code=429, detail="Rate limit exceeded, retry after 60s")
         if resp.status_code != 200:
+            if family and resp.status_code in (403, 410):
+                ttl = DENIAL_TTL[resp.status_code]
+                _denied[family] = (time.time() + ttl, resp.status_code, resp.text)
+                logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, ttl)
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         data = resp.json()
 
@@ -85,26 +112,21 @@ async def search_tickers(q: str = Query(..., min_length=1)):
     return {"results": results}
 
 
-@app.get("/api/quote/{ticker}")
-async def get_quote(ticker: str):
-    ticker = ticker.upper()
-    data = await rate_limited_get(
-        f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
-    )
-    snap = data.get("ticker", {})
-    day = snap.get("day", {})
-    prev = snap.get("prevDay", {})
-    last_trade = snap.get("lastTrade", {})
-    last_quote = snap.get("lastQuote", {})
-    min_data = snap.get("min", {})
+def _normalize_snapshot(snap: dict) -> dict:
+    """Flatten a Polygon ticker snapshot into the shape the frontend expects."""
+    day = snap.get("day") or {}
+    prev = snap.get("prevDay") or {}
+    last_trade = snap.get("lastTrade") or {}
+    last_quote = snap.get("lastQuote") or {}
+    min_data = snap.get("min") or {}
 
-    price = last_trade.get("p") or day.get("c") or prev.get("c") or 0
+    price = last_trade.get("p") or min_data.get("c") or day.get("c") or prev.get("c") or 0
     prev_close = prev.get("c") or 0
     change = round(price - prev_close, 4) if prev_close else 0
     change_pct = round((change / prev_close) * 100, 4) if prev_close else 0
 
     return {
-        "ticker": ticker,
+        "ticker": snap.get("ticker"),
         "price": price,
         "change": change,
         "change_pct": change_pct,
@@ -114,15 +136,174 @@ async def get_quote(ticker: str):
         "close": day.get("c") or prev.get("c"),
         "volume": day.get("v") or prev.get("v"),
         "vwap": day.get("vw") or prev.get("vw"),
-        "bid": last_quote.get("P"),
-        "ask": last_quote.get("a"),
-        "bid_size": last_quote.get("S"),
-        "ask_size": last_quote.get("s"),
+        "bid": last_quote.get("p"),
+        "ask": last_quote.get("P"),
+        "bid_size": last_quote.get("s"),
+        "ask_size": last_quote.get("S"),
         "prev_close": prev_close,
         "min_open": min_data.get("o"),
         "min_close": min_data.get("c"),
         "updated": snap.get("updated"),
     }
+
+
+def _is_denied(e: HTTPException) -> bool:
+    return e.status_code in (401, 403, 410)
+
+
+def _eod_quote(ticker: str, bar: dict, prev_close: Optional[float]) -> dict:
+    """Build a quote from end-of-day aggregate bars (free-tier fallback)."""
+    price = bar.get("c") or 0
+    change = round(price - prev_close, 4) if prev_close else 0
+    change_pct = round((change / prev_close) * 100, 4) if prev_close else 0
+    return {
+        "ticker": ticker,
+        "price": price,
+        "change": change,
+        "change_pct": change_pct,
+        "open": bar.get("o"),
+        "high": bar.get("h"),
+        "low": bar.get("l"),
+        "close": bar.get("c"),
+        "volume": bar.get("v"),
+        "vwap": bar.get("vw"),
+        "bid": None, "ask": None, "bid_size": None, "ask_size": None,
+        "prev_close": prev_close,
+        "updated": bar.get("t"),
+        "source": "eod",
+    }
+
+
+async def _recent_daily_bars(ticker: str) -> list[dict]:
+    today = datetime.utcnow()
+    data = await rate_limited_get(
+        f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
+        f"{(today - timedelta(days=10)).strftime('%Y-%m-%d')}/{today.strftime('%Y-%m-%d')}",
+        {"adjusted": "true", "sort": "asc", "limit": 50},
+    )
+    return data.get("results") or []
+
+
+async def _eod_single_quote(ticker: str) -> dict:
+    key = ("quote", ticker)
+    if key in eod_cache:
+        return eod_cache[key]
+    bars = await _recent_daily_bars(ticker)
+    if not bars:
+        raise HTTPException(status_code=404, detail=f"No data for {ticker}")
+    prev_close = bars[-2].get("c") if len(bars) > 1 else None
+    quote = _eod_quote(ticker, bars[-1], prev_close)
+    eod_cache[key] = quote
+    return quote
+
+
+async def _eod_market() -> dict[str, dict]:
+    """Whole-market EOD table from the last two grouped-daily sessions (3 requests, cached)."""
+    if "market" in eod_cache:
+        return eod_cache["market"]
+    # SPY trades every session, so its bars tell us the last two trading dates.
+    spy = await _recent_daily_bars("SPY")
+    if len(spy) < 2:
+        raise HTTPException(status_code=503, detail="Could not determine recent trading sessions")
+    last_day, prev_day = (
+        datetime.utcfromtimestamp(b["t"] / 1000).strftime("%Y-%m-%d") for b in (spy[-1], spy[-2])
+    )
+
+    async def grouped(day: str) -> list[dict]:
+        data = await rate_limited_get(
+            f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"}
+        )
+        return data.get("results") or []
+
+    prev_rows = {r["T"]: r.get("c") for r in await grouped(prev_day)}
+    market = {
+        r["T"]: _eod_quote(r["T"], r, prev_rows.get(r["T"])) for r in await grouped(last_day)
+    }
+    eod_cache["market"] = market
+    return market
+
+
+@app.get("/api/quote/{ticker}")
+async def get_quote(ticker: str):
+    ticker = ticker.upper()
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
+            family="snapshot",
+        )
+    except HTTPException as e:
+        if not _is_denied(e):
+            raise
+        return await _eod_single_quote(ticker)
+    quote = _normalize_snapshot(data.get("ticker", {}))
+    quote["ticker"] = ticker
+    quote["source"] = "live"
+    return quote
+
+
+TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,10}$")
+MAX_WATCHLIST = 50
+# Movers filters: skip illiquid penny names that dominate raw % rankings.
+MOVERS_MIN_PRICE = 5.0
+MOVERS_MIN_VOLUME = 1_000_000
+
+
+@app.get("/api/watchlist")
+async def get_watchlist(tickers: str = Query(..., min_length=1)):
+    """Batch quotes for many tickers in a single upstream request."""
+    symbols = []
+    for raw in tickers.split(","):
+        t = raw.strip().upper()
+        if t and TICKER_RE.match(t) and t not in symbols:
+            symbols.append(t)
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No valid tickers supplied")
+    symbols = symbols[:MAX_WATCHLIST]
+
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers",
+            {"tickers": ",".join(symbols)},
+            family="snapshot",
+        )
+        by_ticker = {}
+        for snap in data.get("tickers") or []:
+            q = _normalize_snapshot(snap)
+            q["source"] = "live"
+            by_ticker[q["ticker"]] = q
+    except HTTPException as e:
+        if not _is_denied(e):
+            raise
+        by_ticker = await _eod_market()
+
+    # Preserve the caller's ordering; unknown symbols come back as empty rows.
+    quotes = [by_ticker.get(t) or {"ticker": t, "price": None} for t in symbols]
+    return {"quotes": quotes}
+
+
+@app.get("/api/movers/{direction}")
+async def get_movers(direction: str):
+    direction = direction.lower()
+    if direction not in ("gainers", "losers"):
+        raise HTTPException(status_code=400, detail="direction must be 'gainers' or 'losers'")
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/{direction}",
+            family="snapshot",
+        )
+        movers = [_normalize_snapshot(s) for s in (data.get("tickers") or [])[:20]]
+        return {"direction": direction, "source": "live", "movers": movers}
+    except HTTPException as e:
+        if not _is_denied(e):
+            raise
+
+    candidates = [
+        q for q in (await _eod_market()).values()
+        if q["prev_close"] and (q["price"] or 0) >= MOVERS_MIN_PRICE
+        and (q["volume"] or 0) >= MOVERS_MIN_VOLUME
+    ]
+    candidates.sort(key=lambda q: q["change_pct"], reverse=(direction == "gainers"))
+    return {"direction": direction, "source": "eod", "movers": candidates[:20]}
 
 
 @app.get("/api/aggs/{ticker}")
@@ -173,7 +354,7 @@ async def get_aggs(
 @app.get("/api/options/{ticker}")
 async def get_options(
     ticker: str,
-    limit: int = Query(20),
+    limit: int = Query(40),
     strike_price_gte: Optional[float] = None,
     strike_price_lte: Optional[float] = None,
 ):
@@ -187,11 +368,12 @@ async def get_options(
     try:
         data = await rate_limited_get(
             f"{BASE_URL}/v3/snapshot/options/{ticker}",
-            params
+            params,
+            family="options",
         )
     except HTTPException as e:
-        if e.status_code in (401, 403):
-            return {"ticker": ticker, "options": [], "error": "Options data requires a paid Polygon plan"}
+        if _is_denied(e):
+            return {"ticker": ticker, "options": [], "error": "Options data requires Polygon Options Add-on"}
         raise
 
     results = data.get("results", [])
@@ -245,10 +427,16 @@ async def get_news(ticker: str, limit: int = Query(10)):
 @app.get("/api/financials/{ticker}")
 async def get_financials(ticker: str):
     ticker = ticker.upper()
-    data = await rate_limited_get(
-        f"{BASE_URL}/vX/reference/financials",
-        {"ticker": ticker, "limit": 4, "sort": "filing_date", "order": "desc"}
-    )
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/vX/reference/financials",
+            {"ticker": ticker, "limit": 4, "sort": "filing_date", "order": "desc"},
+            family="financials",
+        )
+    except HTTPException as e:
+        if _is_denied(e):
+            return {"ticker": ticker, "financials": [], "error": "Financials unavailable on current Polygon plan"}
+        raise
     results = data.get("results", [])
     if not results:
         return {"ticker": ticker, "financials": []}
@@ -281,6 +469,118 @@ async def get_financials(ticker: str):
         })
 
     return {"ticker": ticker, "financials": financials}
+
+
+@app.get("/api/earnings/{ticker}")
+async def get_earnings(ticker: str):
+    ticker = ticker.upper()
+    try:
+        data = await rate_limited_get(
+            f"{BASE_URL}/vX/reference/financials",
+            {"ticker": ticker, "limit": 8, "sort": "filing_date", "order": "desc"},
+            family="financials",
+        )
+    except HTTPException as e:
+        if _is_denied(e):
+            return {"ticker": ticker, "earnings": [], "error": "Earnings data unavailable on current Polygon plan"}
+        raise
+
+    results = data.get("results", [])
+    earnings = []
+    for r in results:
+        income = r.get("financials", {}).get("income_statement", {})
+        eps = income.get("basic_earnings_per_share", {}).get("value")
+        rev = income.get("revenues", {}).get("value")
+        earnings.append({
+            "fiscal_period": r.get("fiscal_period"),
+            "fiscal_year": r.get("fiscal_year"),
+            "filing_date": r.get("filing_date"),
+            "start_date": r.get("start_date"),
+            "end_date": r.get("end_date"),
+            "eps": eps,
+            "revenues": rev,
+        })
+    return {"ticker": ticker, "earnings": earnings}
+
+
+def _macro_events():
+    """Generate known macro events for the next 12 months from today."""
+    today = datetime.utcnow().date()
+    events = []
+
+    # FOMC meetings 2025-2026 (scheduled dates)
+    fomc_dates = [
+        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+        "2025-07-30", "2025-09-17", "2025-11-05", "2025-12-17",
+        "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
+        "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16",
+    ]
+    for d in fomc_dates:
+        dt = datetime.strptime(d, "%Y-%m-%d").date()
+        if abs((dt - today).days) <= 180:
+            events.append({"date": d, "event": "FOMC Rate Decision", "category": "FED", "importance": "HIGH"})
+
+    # CPI releases (approx 2nd Wed of each month, but use known schedule)
+    # Approximate: 13th-15th of each month
+    for month_offset in range(-3, 9):
+        ref = today.replace(day=1)
+        year = ref.year
+        month = ref.month + month_offset
+        while month > 12:
+            month -= 12
+            year += 1
+        while month < 1:
+            month += 12
+            year -= 1
+        approx_day = min(14, 28)
+        try:
+            dt = datetime(year, month, approx_day).date()
+            events.append({"date": str(dt), "event": "CPI Inflation Report", "category": "ECON", "importance": "HIGH"})
+        except ValueError:
+            pass
+
+    # NFP — first Friday of each month
+    for month_offset in range(-3, 9):
+        ref = today.replace(day=1)
+        year = ref.year
+        month = ref.month + month_offset
+        while month > 12:
+            month -= 12
+            year += 1
+        while month < 1:
+            month += 12
+            year -= 1
+        try:
+            first = datetime(year, month, 1).date()
+            # Find first Friday
+            days_ahead = 4 - first.weekday()
+            if days_ahead < 0:
+                days_ahead += 7
+            nfp_date = first + timedelta(days=days_ahead)
+            events.append({"date": str(nfp_date), "event": "Non-Farm Payrolls", "category": "ECON", "importance": "HIGH"})
+        except ValueError:
+            pass
+
+    # GDP releases (approx end of Jan, Apr, Jul, Oct)
+    gdp_months = [1, 4, 7, 10]
+    for year in [today.year, today.year + 1]:
+        for m in gdp_months:
+            try:
+                dt = datetime(year, m, 30).date()
+                events.append({"date": str(dt), "event": "GDP Growth Rate", "category": "ECON", "importance": "MED"})
+            except ValueError:
+                pass
+
+    events.sort(key=lambda x: x["date"])
+    # Keep events within ±6 months
+    cutoff_past = str(today - timedelta(days=90))
+    cutoff_future = str(today + timedelta(days=180))
+    return [e for e in events if cutoff_past <= e["date"] <= cutoff_future]
+
+
+@app.get("/api/economic-events")
+async def get_economic_events():
+    return {"events": _macro_events()}
 
 
 @app.get("/api/ticker-details/{ticker}")

@@ -5,7 +5,9 @@ import ChartPanel from './components/ChartPanel';
 import OptionsPanel from './components/OptionsPanel';
 import NewsPanel from './components/NewsPanel';
 import FinancialsPanel from './components/FinancialsPanel';
-import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails } from './api';
+import CalendarPanel from './components/CalendarPanel';
+import MonitorPanel from './components/MonitorPanel';
+import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails, getEarnings, getEconomicEvents } from './api';
 import './App.css';
 
 function PanelHeader({ label }) {
@@ -51,6 +53,10 @@ export default function App() {
   const [loadingOptions, setLoadingOptions] = useState(false);
   const [loadingNews, setLoadingNews] = useState(false);
   const [loadingFinancials, setLoadingFinancials] = useState(false);
+  const [earnings, setEarnings] = useState(null);
+  const [macroEvents, setMacroEvents] = useState(null);
+  const [loadingEarnings, setLoadingEarnings] = useState(false);
+  const [loadingMacro, setLoadingMacro] = useState(false);
 
   const intervalRef = useRef(null);
   const currentTicker = useRef('');
@@ -67,6 +73,18 @@ export default function App() {
     check();
     const id = setInterval(check, 10000);
     return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const loadMacro = async () => {
+      setLoadingMacro(true);
+      try {
+        const r = await getEconomicEvents();
+        setMacroEvents(r.data.events);
+      } catch (e) { console.error('Macro events error:', e); }
+      finally { setLoadingMacro(false); }
+    };
+    loadMacro();
   }, []);
 
   useEffect(() => {
@@ -107,6 +125,7 @@ export default function App() {
     setLoadingOptions(true);
     setLoadingNews(true);
     setLoadingFinancials(true);
+    setLoadingEarnings(true);
 
     try {
       const r = await getTickerDetails(t);
@@ -136,6 +155,14 @@ export default function App() {
       setOptions(r.data.options);
     } catch (e) { console.error('Options error:', e); }
     finally { setLoadingOptions(false); }
+
+    await new Promise(r => setTimeout(r, 400));
+
+    try {
+      const r = await getEarnings(t);
+      setEarnings(r.data.earnings);
+    } catch (e) { console.error('Earnings error:', e); }
+    finally { setLoadingEarnings(false); }
   }, []);
 
   const handleTickerSelect = useCallback(async (t) => {
@@ -145,7 +172,7 @@ export default function App() {
     currentTicker.current = t;
 
     setQuote(null); setDetails(null); setBars(null);
-    setOptions(null); setNews(null); setFinancials(null);
+    setOptions(null); setNews(null); setFinancials(null); setEarnings(null);
 
     setLoadingQuote(true);
     try {
@@ -160,7 +187,7 @@ export default function App() {
     if (intervalRef.current) clearInterval(intervalRef.current);
     intervalRef.current = setInterval(() => {
       if (currentTicker.current) loadQuote(currentTicker.current);
-    }, 5000);
+    }, 2000);
   }, [loadQuote, loadChart, loadStaticData, timeframe]);
 
   const handleTimeframeChange = useCallback((tf) => {
@@ -198,28 +225,49 @@ export default function App() {
           </Panel>
 
           <div style={{ flex: 1, display: 'flex', gap: '2px', minHeight: 0 }}>
-            <Panel style={{ flex: '0 0 38%' }}>
+            <Panel style={{ flex: '0 0 28%' }}>
               <PanelHeader label="OPTIONS CHAIN" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
                 <OptionsPanel options={options} loading={loadingOptions} />
               </div>
             </Panel>
 
-            <Panel style={{ flex: '0 0 32%' }}>
+            <Panel style={{ flex: '0 0 24%' }}>
               <PanelHeader label="NEWS FEED" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
                 <NewsPanel news={news} loading={loadingNews} />
               </div>
             </Panel>
 
-            <Panel style={{ flex: 1 }}>
+            <Panel style={{ flex: '0 0 24%' }}>
               <PanelHeader label="FUNDAMENTALS" />
               <div style={{ flex: 1, overflow: 'hidden' }}>
                 <FinancialsPanel financials={financials} loading={loadingFinancials} />
               </div>
             </Panel>
+
+            <Panel style={{ flex: 1 }}>
+              <PanelHeader label="ECONOMIC CALENDAR" />
+              <div style={{ flex: 1, overflow: 'hidden' }}>
+                <CalendarPanel
+                  earnings={earnings}
+                  macroEvents={macroEvents}
+                  ticker={ticker}
+                  loadingEarnings={loadingEarnings}
+                  loadingMacro={loadingMacro}
+                />
+              </div>
+            </Panel>
           </div>
         </div>
+
+        {/* Far right: watchlist + market movers */}
+        <Panel style={{ width: '230px', flexShrink: 0 }}>
+          <PanelHeader label="MONITOR" />
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <MonitorPanel activeTicker={ticker} onSelect={handleTickerSelect} />
+          </div>
+        </Panel>
       </div>
     </div>
   );

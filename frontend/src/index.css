@@ -38,3 +38,8 @@ html, body, #root {
 .down { color: var(--red); }
 .neutral { color: var(--text-dim); }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.monitor-row:hover { background: var(--bg3) !important; }
+.monitor-row .monitor-remove { visibility: hidden; }
+.monitor-row:hover .monitor-remove { visibility: visible; }
+.monitor-remove:hover { color: var(--red) !important; }
