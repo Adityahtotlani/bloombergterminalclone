@@ -12,13 +12,17 @@ import './App.css';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/** Retry while the backend's rate-limit queue is full (503) — the panel stays in LOADING. */
+// Transient backend answers worth retrying: rate-limit queue full (503), provider
+// unreachable (502) or timed out (504).
+const RETRY_STATUSES = new Set([502, 503, 504]);
+
+/** Retry transient failures a bounded number of times — the panel stays in LOADING. */
 async function withBusyRetry(fn, signal, attempts = 4) {
   for (let i = 0; ; i++) {
     try {
       return await fn();
     } catch (e) {
-      if (signal?.aborted || e?.response?.status !== 503 || i >= attempts - 1) throw e;
+      if (signal?.aborted || !RETRY_STATUSES.has(e?.response?.status) || i >= attempts - 1) throw e;
       await sleep(3000);
       if (signal?.aborted) throw e;
     }
@@ -63,6 +67,8 @@ export default function App() {
   const [timeframe, setTimeframe] = useState('1M');
   const timeframeRef = useRef('1M');
   const [connected, setConnected] = useState(false);
+  // Quote freshness reported by /api/health: 'live' | 'eod' | 'unknown'.
+  const [dataMode, setDataMode] = useState('unknown');
 
   const [loadingQuote, setLoadingQuote] = useState(false);
   const [loadingChart, setLoadingChart] = useState(false);
@@ -80,6 +86,8 @@ export default function App() {
   const currentTicker = useRef('');
   // Aborts the previous ticker's in-flight requests so they stop holding rate-limit slots.
   const tickerAbort = useRef(null);
+  // Aborts the previous chart request when the timeframe (or ticker) changes.
+  const chartAbort = useRef(null);
   const quotePending = useRef(false);
 
   useEffect(() => {
@@ -87,6 +95,9 @@ export default function App() {
       try {
         const res = await fetch('/api/health');
         setConnected(res.ok);
+        if (!res.ok) return;
+        const body = await res.json().catch(() => null);
+        setDataMode(body?.data === 'live' || body?.data === 'eod' ? body.data : 'unknown');
       } catch {
         setConnected(false);
       }
@@ -130,15 +141,28 @@ export default function App() {
     }
   }, []);
 
-  const loadChart = useCallback(async (t, tf, signal) => {
+  // `tickerSignal` (the ticker's AbortController) also cancels this load on a ticker switch.
+  const loadChart = useCallback(async (t, tf, tickerSignal) => {
+    chartAbort.current?.abort();
+    const controller = new AbortController();
+    chartAbort.current = controller;
+    const { signal } = controller;
+    const onTickerAbort = () => controller.abort();
+    if (tickerSignal?.aborted) controller.abort();
+    else tickerSignal?.addEventListener('abort', onTickerAbort, { once: true });
+    // Only the newest load may write bars, and only for the ticker and timeframe on screen.
+    const isCurrent = () => chartAbort.current === controller
+      && currentTicker.current === t && timeframeRef.current === tf;
+
     setLoadingChart(true);
     try {
       const res = await withBusyRetry(() => getAggs(t, tf, { signal }), signal);
-      if (currentTicker.current === t) setBars(res.data.bars);
+      if (isCurrent() && !signal.aborted) setBars(res.data.bars);
     } catch (e) {
-      if (!signal?.aborted) console.error('Chart error:', e);
+      if (!signal.aborted) console.error('Chart error:', e);
     } finally {
-      if (currentTicker.current === t) setLoadingChart(false);
+      tickerSignal?.removeEventListener('abort', onTickerAbort);
+      if (chartAbort.current === controller) setLoadingChart(false);
     }
   }, []);
 
@@ -206,7 +230,7 @@ export default function App() {
   const handleTimeframeChange = useCallback((tf) => {
     setTimeframe(tf);
     timeframeRef.current = tf;
-    if (ticker) loadChart(ticker, tf);
+    if (ticker) loadChart(ticker, tf, tickerAbort.current?.signal);
   }, [ticker, loadChart]);
 
   useEffect(() => {
@@ -215,7 +239,7 @@ export default function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
-      <TopBar onTickerSelect={handleTickerSelect} connected={connected} />
+      <TopBar onTickerSelect={handleTickerSelect} connected={connected} dataMode={dataMode} />
 
       <div style={{ flex: 1, display: 'flex', gap: '2px', padding: '2px', minHeight: 0, overflow: 'hidden' }}>
         {/* Left: quote panel */}
@@ -268,6 +292,7 @@ export default function App() {
                   macroEvents={macroEvents}
                   ticker={ticker}
                   loadingEarnings={loadingEarnings}
+                  earningsError={panelErrors.earnings}
                   loadingMacro={loadingMacro}
                 />
               </div>

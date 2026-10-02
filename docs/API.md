@@ -40,10 +40,13 @@ FastAPI errors have the shape `{"detail": ...}`.
 | `403` / `410` *(degraded, usually not seen)* | The plan isn't entitled (403), or the endpoint is in a deprecation brownout (410). For the `snapshot`, `options` and `financials` families the backend **catches** this and degrades instead of failing. Quotes, watchlist and movers fall back to EOD. Options, financials and earnings return **200** with an `error` string and an empty list. Endpoints outside those families (search, aggs, news, ticker-details) pass Polygon's status and body through unchanged. | Polygon's JSON error body, as a string |
 | `404` | EOD quote fallback found no daily bars for the ticker | `"No data for XYZ"` |
 | `499` | The request was waiting in the rate-limit queue and every client waiting on it disconnected. This is non-standard. Clients never actually receive it, but it shows in the logs as `Dropped queued upstream call ...`. | `"Client disconnected"` |
-| `500` | Unhandled failure, for example an upstream network timeout (httpx, 15 s) | — |
+| `502` | Polygon couldn't be reached (connection refused, DNS or TLS failure, dropped connection, or another `httpx` request error), or it answered 200 with a body that isn't valid JSON | `"Data provider unreachable — retry shortly"` / `"Data provider sent an invalid response — retry shortly"` |
 | `503` | No upstream slot within 75 s (`MAX_QUEUE_WAIT`), Polygon answered 429 twice, or the EOD table couldn't find two recent sessions | `"Data provider rate limit busy — retry shortly"` |
+| `504` | Polygon didn't answer within the 15 s `httpx` timeout | `"Data provider timed out — retry shortly"` |
 
-**Clients should retry 503s.** The frontend retries up to 4 attempts in total, 3 s apart.
+A 502 or 504 is never cached, and every request coalesced onto the failed upstream call gets the same error. The failed attempt still counts against the per-minute quota. Any other unhandled failure would still be a plain `500`.
+
+**Clients should retry 502, 503 and 504.** The frontend retries them up to 4 attempts in total, 3 s apart.
 
 ## Caching and quota cost
 
@@ -68,11 +71,19 @@ All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute 
 
 ## `GET /api/health`
 
-Liveness check. It doesn't touch Polygon, and the UI's LIVE indicator polls it.
+Liveness check, plus the backend's current quote freshness. It never calls Polygon, so it costs no quota. The UI's top-bar indicator polls it every 10 s.
 
 ```json
-{"status": "ok", "time": "2026-10-02T08:29:44.767618"}
+{"status": "ok", "time": "2026-10-02T14:38:24.582906", "data": "eod"}
 ```
+
+| Field | Meaning |
+|---|---|
+| `status` | Always `"ok"` when the backend answers |
+| `time` | Server time, naive ISO string in UTC |
+| `data` | `"eod"` while the `snapshot` family is in the denial memo (not entitled, so quotes, watchlist and movers are end-of-day). `"live"` once a `snapshot`-family call (quote, watchlist or movers) has succeeded upstream since startup and hasn't been denied since. `"unknown"` before any snapshot call has been made, for example right after a restart, or after a snapshot denial has expired and hasn't been re-checked yet |
+
+`data` comes from in-memory state only, so it changes only after a data request reaches Polygon. A fresh backend reports `"unknown"` until the first quote, watchlist or movers request.
 
 ## `GET /api/search`
 

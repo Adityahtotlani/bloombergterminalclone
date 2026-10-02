@@ -39,7 +39,15 @@ function Clock() {
   );
 }
 
-export default function TopBar({ onTickerSelect, connected }) {
+// Backend reachability plus the quote freshness /api/health reports.
+const STATUS = {
+  live: { label: 'LIVE', color: 'var(--green)', glow: true, title: 'Real-time snapshot quotes' },
+  eod: { label: 'EOD DATA', color: 'var(--amber)', glow: true, title: 'Connected — quotes are end-of-day (live snapshots not in the current Polygon plan)' },
+  unknown: { label: 'CONNECTED', color: 'var(--text-dim)', glow: false, title: 'Connected — data freshness not known yet' },
+  down: { label: 'DISCONNECTED', color: 'var(--red)', glow: true, title: 'Backend unreachable' },
+};
+
+export default function TopBar({ onTickerSelect, connected, dataMode }) {
   const [input, setInput] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [open, setOpen] = useState(false);
@@ -47,6 +55,7 @@ export default function TopBar({ onTickerSelect, connected }) {
   // Search results rarely change; caching them saves scarce API requests.
   const searchCache = useRef(new Map());
   const inputRef = useRef(null);
+  const status = !connected ? STATUS.down : STATUS[dataMode] || STATUS.unknown;
 
   useEffect(() => {
     const handler = (e) => {
@@ -146,14 +155,17 @@ export default function TopBar({ onTickerSelect, connected }) {
 
       <Clock />
 
-      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px' }}>
+      <div
+        title={status.title}
+        style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px' }}
+      >
         <div style={{
           width: '8px', height: '8px', borderRadius: '50%',
-          background: connected ? 'var(--green)' : 'var(--red)',
-          boxShadow: connected ? '0 0 6px var(--green)' : '0 0 6px var(--red)',
+          background: status.color,
+          boxShadow: status.glow ? `0 0 6px ${status.color}` : 'none',
         }} />
-        <span style={{ color: connected ? 'var(--green)' : 'var(--red)', fontSize: '10px' }}>
-          {connected ? 'LIVE' : 'DISCONNECTED'}
+        <span style={{ color: status.color, fontSize: '10px' }}>
+          {status.label}
         </span>
       </div>
     </div>

@@ -102,6 +102,9 @@ Backend warnings worth knowing:
 | `Polygon denied financials (410); skipping for 300s` | The vX financials brownout is active. It's retried after 5 min |
 | `Polygon returned 429 for ...; backing off` | Polygon's window is fuller than the local count (usually just after a restart). It's retried once |
 | `Dropped queued upstream call ...: all clients disconnected` | A user switched tickers or closed the tab while the call was queued. Harmless; it frees a slot |
+| `Polygon request timed out for ... (ReadTimeout)` | Polygon didn't answer within 15 s. The client got a 504 |
+| `Polygon request failed for ... (ConnectError)` | Polygon couldn't be reached (network, DNS or TLS). The client got a 502 |
+| `Polygon returned invalid JSON for ...` | Polygon answered 200 with a non-JSON body. The client got a 502 |
 | `[vite] http proxy error: /api/... ECONNREFUSED 127.0.0.1:8010` (bbg-web) | The backend was down or restarting when the frontend proxied a request |
 
 The backend never logs the API key. Keep it that way: don't add logging of upstream URLs with their query strings, because the key travels as the `apiKey` query parameter.
@@ -161,6 +164,15 @@ journalctl -u bbg-api --since "10 min ago" | grep "GET /api/" | awk '{print $10}
 ```
 
 Client IPs in the access log are not useful here. Public traffic arrives through the local tunnel.
+
+### "Data provider timed out" (504) or "Data provider unreachable" (502)
+
+The backend couldn't get an answer from Polygon. The browser already retried a few times before showing the message. Nothing is cached on failure, so the next request tries again.
+
+- Check the log lines: `journalctl -u bbg-api --since "10 min ago" | grep -E "timed out|request failed|invalid JSON"`.
+- Check that the server itself can reach Polygon: `curl -s -o /dev/null -w '%{http_code}\n' https://api.polygon.io/` (no key, so no quota). Any HTTP status, even 404, means it's reachable. `000` means it isn't.
+- Check Polygon's status page. Repeated 504s across all endpoints usually mean a provider incident. Repeated 502s usually mean a local network or DNS problem.
+- Each failed attempt still uses one of the 5 requests per minute, so panels may be slower to fill afterwards.
 
 ### Data panel shows "unavailable" or "requires add-on"
 

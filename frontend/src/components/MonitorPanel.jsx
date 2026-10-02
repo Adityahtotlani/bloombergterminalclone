@@ -5,6 +5,7 @@ import {
   serializeHoldings, deserializeHoldings, toDecimalString,
   formatAmount, formatPrice, formatQty, MAX_HOLDINGS, QTY_DP, PRICE_DP,
 } from '../lib/portfolio';
+import { MAX_WATCHLIST } from '../lib/limits';
 
 const STORAGE_KEY = 'bbg.watchlist';
 const PORTFOLIO_KEY = 'bbg.portfolio';
@@ -26,7 +27,8 @@ const fmtVol = (n) => {
 function loadWatchlist() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (Array.isArray(saved) && saved.every(t => typeof t === 'string')) return saved;
+    // Lists saved before the cap existed may be longer than the server prices: keep the first N.
+    if (Array.isArray(saved) && saved.every(t => typeof t === 'string')) return saved.slice(0, MAX_WATCHLIST);
   } catch { /* storage unavailable or corrupt — fall back to defaults */ }
   return DEFAULT_WATCHLIST;
 }
@@ -145,10 +147,11 @@ function WatchTab({ activeTicker, onSelect }) {
   );
   const { data: quotes, loading, error } = usePolling(fetcher, WATCH_REFRESH_MS, list.length > 0);
 
+  const full = list.length >= MAX_WATCHLIST;
   const add = (raw) => {
     const t = (raw || '').trim().toUpperCase();
-    if (!TICKER_RE.test(t) || list.includes(t)) return;
-    setList(l => [...l, t]);
+    if (full || !TICKER_RE.test(t) || list.includes(t)) return;
+    setList(l => (l.length >= MAX_WATCHLIST ? l : [...l, t]));
     setInput('');
   };
   const remove = (t) => setList(l => l.filter(x => x !== t));
@@ -163,26 +166,36 @@ function WatchTab({ activeTicker, onSelect }) {
           value={input}
           onChange={(e) => setInput(e.target.value.toUpperCase())}
           onKeyDown={(e) => { if (e.key === 'Enter') add(input); }}
-          placeholder="ADD SYMBOL"
+          placeholder={full ? 'WATCHLIST FULL' : 'ADD SYMBOL'}
+          disabled={full}
           aria-label="Add symbol to watchlist"
           style={{
             flex: 1, minWidth: 0, background: 'var(--bg3)', border: '1px solid var(--border-bright)',
             color: 'var(--amber)', padding: '2px 6px', fontFamily: 'var(--font)', fontSize: '11px', outline: 'none',
+            opacity: full ? 0.6 : 1,
           }}
         />
         <button
           onClick={() => add(activeTicker)}
-          disabled={!activeTicker || list.includes(activeTicker)}
+          disabled={full || !activeTicker || list.includes(activeTicker)}
           title="Add the loaded ticker"
           style={{
             background: 'var(--bg3)', border: '1px solid var(--border-bright)', color: 'var(--amber)',
             fontFamily: 'var(--font)', fontSize: '10px', padding: '2px 6px', cursor: 'pointer',
-            opacity: !activeTicker || list.includes(activeTicker) ? 0.4 : 1,
+            opacity: full || !activeTicker || list.includes(activeTicker) ? 0.4 : 1,
           }}
         >
           +CUR
         </button>
       </div>
+      {full && (
+        <div
+          title={`The server prices at most ${MAX_WATCHLIST} symbols — remove one to add another`}
+          style={{ padding: '2px 8px', fontSize: '9px', color: 'var(--amber-dim)', letterSpacing: '1px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}
+        >
+          WATCHLIST FULL ({MAX_WATCHLIST})
+        </div>
+      )}
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
         {list.length === 0 && <Message>WATCHLIST EMPTY</Message>}
         {list.length > 0 && loading && !quotes && <Message color="var(--text-dim)">LOADING...</Message>}

@@ -27,14 +27,15 @@ From the project root, `./start.sh` starts the backend and this dev server toget
 
 | Path | Contents |
 |---|---|
-| `src/App.jsx` | Page layout, per-ticker loading (parallel requests, abort on ticker switch, 503 retry), 2 s quote polling, health check |
+| `src/App.jsx` | Page layout, per-ticker loading (parallel requests, abort on ticker or timeframe switch, 502/503/504 retry), 2 s quote polling, health check and data mode |
 | `src/api.js` | axios wrappers for every `/api/*` endpoint ([API reference](../docs/API.md)) |
-| `src/components/TopBar.jsx` | Ticker search (F1), world clocks, LIVE indicator |
+| `src/components/TopBar.jsx` | Ticker search (F1), world clocks, LIVE / EOD DATA / CONNECTED / DISCONNECTED indicator |
 | `src/components/QuotePanel.jsx` | Quote, session stats, company info, EOD label |
 | `src/components/ChartPanel.jsx` | lightweight-charts candlestick and volume chart with timeframe buttons |
 | `src/components/OptionsPanel.jsx`, `NewsPanel.jsx`, `FinancialsPanel.jsx`, `CalendarPanel.jsx` | Bottom-row panels |
 | `src/components/MonitorPanel.jsx` | WATCH / GAINERS / LOSERS / PORT tabs |
 | `src/lib/portfolio.js` | Pure portfolio P&L math, using fixed-point BigInt ([methodology](../docs/DATA-SOURCES.md#portfolio-pl-methodology)) |
+| `src/lib/limits.js` | Limits mirrored from `backend/main.py` (`MAX_WATCHLIST` = 50, used by WATCH and PORT) |
 | `scripts/test-portfolio.mjs` | `node:test` checks for `portfolio.js` |
 | `vite.config.js` | Dev and preview server, `/api` proxy, allowed hosts |
 

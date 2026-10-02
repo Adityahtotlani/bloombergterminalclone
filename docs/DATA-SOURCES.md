@@ -12,7 +12,7 @@ All market data comes from **[Polygon.io](https://polygon.io)**, which has rebra
 
 | Capability | Free tier (current key) | What the app does |
 |---|---|---|
-| Request quota | **5 requests/minute** | A FIFO queue paces every upstream call app-wide. Requests that wait longer than 75 s get a 503, and the UI retries them (see [ARCHITECTURE.md](ARCHITECTURE.md)) |
+| Request quota | **5 requests/minute** | A FIFO queue paces every upstream call app-wide. Requests that wait longer than 75 s get a 503, and the UI retries them (and 502/504 provider errors) (see [ARCHITECTURE.md](ARCHITECTURE.md)) |
 | Live snapshots (`/v2/snapshot/...`), which supply last trade, NBBO, today's bar and movers | **Not entitled (403)** | Falls back to **end-of-day** data built from daily bars, labelled EOD |
 | Daily and intraday aggregates (`/v2/aggs/...`) | Available | Charts. The grouped-daily bars also feed the EOD fallback |
 | Reference data (ticker search, ticker details) | Available | Search box and the company section of the QUOTE panel |

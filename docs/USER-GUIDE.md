@@ -8,7 +8,7 @@ How to use the terminal at <https://bloomberg.adityatotlani.ch>, or at <http://l
 
 ```text
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ BBG TERMINAL  [TICKER SEARCH]   NY hh:mm:ss  LON …  TKY …            ● LIVE    │
+│ BBG TERMINAL  [TICKER SEARCH]   NY hh:mm:ss  LON …  TKY …        ● EOD DATA    │
 ├──────────┬─────────────────────────────────────────────────────────┬──────────┤
 │          │ CHART  [1D][5D][1M][3M][1Y]   O H L C                    │ MONITOR  │
 │  QUOTE   │                                                         │ WATCH    │
@@ -46,7 +46,16 @@ Switching tickers cancels the previous ticker's pending requests, so you don't w
 
 - **Ticker search**, described above. Search results are remembered for the session, so retyping a query is instant.
 - **World clocks:** New York, London and Tokyo, 24-hour, updated every second.
-- **LIVE / DISCONNECTED:** shows whether the browser can reach the backend. It checks `/api/health` every 10 s. **LIVE means the server is up, not that prices are real-time.** Data freshness is shown by the EOD labels described below.
+- **Connection and data indicator** (top right), checked against `/api/health` every 10 s:
+
+  | Indicator | Meaning |
+  |---|---|
+  | **LIVE** (green) | Backend reachable and quotes come from live snapshots |
+  | **EOD DATA** (amber) | Backend reachable, but the data plan has no live quotes, so prices are end-of-day. This is the normal state on the free plan |
+  | **CONNECTED** (grey) | Backend reachable, but it hasn't fetched a quote since it started, so freshness isn't known yet. It changes after the next quote loads |
+  | **DISCONNECTED** (red) | The browser can't reach the backend |
+
+  Individual panels also show **EOD · DELAYED** / **END-OF-DAY DATA**, described below.
 
 ## QUOTE panel (left)
 
@@ -98,7 +107,7 @@ Profit lines are green when positive and red when negative. The data comes from 
 Two tabs:
 
 - **MACRO** (default): FOMC rate decisions (category `FED`; `+ SEP` means new economic projections are published), and CPI, Non-Farm Payrolls and GDP releases (category `ECON`). It covers about 3 months back to 6 months ahead. Each event shows its importance (`HIGH` red, `MED` amber) and date. Past events are dimmed, and today's are highlighted and labelled **TODAY**. Events ending in **(est.)** are estimates made by rule because the agency hasn't published that date yet. See [DATA-SOURCES.md](DATA-SOURCES.md#economic-calendar).
-- **EARNINGS:** the loaded ticker's recent reported periods with filing date, basic EPS and revenue. These are past results, not upcoming report dates or analyst estimates.
+- **EARNINGS:** the loaded ticker's recent reported periods with filing date, basic EPS and revenue. These are past results, not upcoming report dates or analyst estimates. If the financials service is unavailable, the tab shows the reason, for example **EARNINGS DATA UNAVAILABLE ON CURRENT POLYGON PLAN**.
 
 ## MONITOR column (right)
 
@@ -111,7 +120,7 @@ Four tabs. Click any row to load that ticker. The row for the currently loaded t
 - **Remove:** hover a row and click **×**.
 - Rows flash green or red briefly when the price ticks up or down.
 - The list is saved in this browser (`localStorage`). It isn't synced between devices or browsers, and clearing site data resets it to the defaults.
-- The server prices at most 50 symbols per request, so symbols beyond the first 50 show `---`.
+- **At most 50 symbols**, the most the server prices in one request. At 50, the add box and **+CUR** are disabled and **WATCHLIST FULL (50)** appears. Remove a symbol to add another. A saved list longer than 50 (from before the cap existed) is cut to its first 50 when the page loads.
 
 ### GAINERS / LOSERS
 
@@ -176,13 +185,15 @@ An **END-OF-DAY DATA** footer means the prices are last-session closes, so **DAY
 
 | Message | Meaning | What to do |
 |---|---|---|
-| `LOADING…` | Waiting for data. On the free plan, requests queue for the shared 5/min quota | Wait. Panels retry on their own for about 10 s of "busy" responses |
+| `LOADING…` | Waiting for data. On the free plan, requests queue for the shared 5/min quota | Wait. Panels retry on their own (up to 4 tries, 3 s apart) when the provider is busy, unreachable or slow |
 | `ENTER TICKER TO BEGIN` / `SELECT A TICKER TO VIEW CHART` / `ENTER A TICKER` | No ticker loaded yet | Search for one |
 | `EOD · DELAYED` / `END-OF-DAY DATA` | Last completed session's data, not live | Expected on the free plan |
 | `OPTIONS DATA REQUIRES POLYGON OPTIONS ADD-ON` | The plan doesn't include options | Needs a plan upgrade |
-| `FINANCIALS UNAVAILABLE ON CURRENT POLYGON PLAN` | Plan or deprecation issue with the financials service (often a temporary 410 brownout) | Try again in about 5 minutes |
+| `FINANCIALS UNAVAILABLE ON CURRENT POLYGON PLAN` / `EARNINGS DATA UNAVAILABLE ON CURRENT POLYGON PLAN` | Plan or deprecation issue with the financials service (often a temporary 410 brownout) | Try again in about 5 minutes |
 | `DATA PROVIDER RATE LIMIT BUSY — RETRY SHORTLY` | The panel waited 75 s and still had no quota slot, even after retries | Re-select the ticker in a minute. Avoid rapid ticker switching |
-| `NO NEWS DATA` / `NO FINANCIAL DATA` / `NO OPTIONS DATA` / `NO EARNINGS DATA` | The provider returned nothing for this ticker. EARNINGS also shows this when financials are unavailable | Try another ticker, e.g. ETFs have no fundamentals |
+| `DATA PROVIDER TIMED OUT — RETRY SHORTLY` / `DATA PROVIDER UNREACHABLE — RETRY SHORTLY` | The data provider didn't answer in 15 s, or couldn't be reached, even after retries | Re-select the ticker in a minute. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
+| `NO NEWS DATA` / `NO FINANCIAL DATA` / `NO OPTIONS DATA` / `NO EARNINGS DATA` | The provider returned nothing for this ticker | Try another ticker, e.g. ETFs have no fundamentals |
+| `WATCHLIST FULL (50)` | The watchlist has reached its 50-symbol limit | Remove a symbol to add another |
 | `NO DATA — MARKET MAY BE CLOSED` | The movers list is empty | Check again later |
 | `REQUEST FAILED` or a provider error text | An unexpected error | Retry. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
 | `DISCONNECTED` (top right, red) | The backend is unreachable | The server or tunnel is down. See OPERATIONS |

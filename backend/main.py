@@ -67,6 +67,9 @@ _request_times: list[float] = []
 # 403 = plan entitlement (stable); 410 = deprecation brownout (intermittent, retry sooner).
 DENIAL_TTL = {403: 30 * 60, 410: 5 * 60}
 _denied: dict[str, tuple[float, int, str]] = {}
+# When a `snapshot`-family call last succeeded upstream (i.e. live quotes work on this key).
+# Cleared when snapshots get denied; /api/health reports the resulting data mode.
+_last_live_snapshot: Optional[float] = None
 
 
 # FIFO ticket queue: requests get upstream slots in arrival order, and a request whose
@@ -176,14 +179,24 @@ async def _fetch_upstream(
     url: str, params: Optional[dict], family: Optional[str],
     store: TTLCache, cache_key: str, flight: _Inflight,
 ) -> dict:
-    global _request_times
+    global _request_times, _last_live_snapshot
     full_params = {"apiKey": API_KEY, **(params or {})}
     label = url.replace(BASE_URL, "")
 
     for attempt in range(2):
         await _acquire_slot(flight.all_clients_gone, label)
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=full_params)
+        # Network failures become clean 504/502s (not raw 500s). This shared task raises, so
+        # every coalesced waiter gets the same error, and nothing is cached. Log `label`
+        # rather than the exception text, which can include the request URL with the API key.
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, params=full_params)
+        except httpx.TimeoutException as e:
+            logger.warning("Polygon request timed out for %s (%s)", label, type(e).__name__)
+            raise HTTPException(status_code=504, detail="Data provider timed out — retry shortly")
+        except httpx.RequestError as e:
+            logger.warning("Polygon request failed for %s (%s)", label, type(e).__name__)
+            raise HTTPException(status_code=502, detail="Data provider unreachable — retry shortly")
         if resp.status_code == 429 and attempt == 0:
             # Polygon's window is fuller than our count (e.g. after a restart): treat it as full.
             logger.warning("Polygon returned 429 for %s; backing off", label)
@@ -197,11 +210,19 @@ async def _fetch_upstream(
         if family and resp.status_code in (403, 410):
             denial_ttl = DENIAL_TTL[resp.status_code]
             _denied[family] = (time.time() + denial_ttl, resp.status_code, resp.text)
+            if family == "snapshot":
+                _last_live_snapshot = None
             logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning("Polygon returned invalid JSON for %s", label)
+        raise HTTPException(status_code=502, detail="Data provider sent an invalid response — retry shortly")
     store[cache_key] = data
+    if family == "snapshot":
+        _last_live_snapshot = time.time()
     return data
 
 
@@ -211,9 +232,20 @@ async def root():
     return RedirectResponse(url="/docs")
 
 
+def _data_mode() -> str:
+    """Quote freshness from local state only (no upstream call): "eod" while snapshots are
+    denied, "live" once a snapshot succeeded since startup, otherwise "unknown"."""
+    denial = _denied.get("snapshot")
+    if denial and time.time() < denial[0]:
+        return "eod"
+    if _last_live_snapshot is not None:
+        return "live"
+    return "unknown"
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": datetime.utcnow().isoformat(), "data": _data_mode()}
 
 
 @app.get("/api/search")

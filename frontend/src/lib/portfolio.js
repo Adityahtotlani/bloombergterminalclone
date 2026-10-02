@@ -22,10 +22,12 @@
  * USD only: every quote served by /api/watchlist is a US-listed equity in USD.
  */
 
+import { MAX_WATCHLIST } from './limits.js';
+
 export const QTY_DP = 6;
 export const PRICE_DP = 6;
 export const AMOUNT_DP = QTY_DP + PRICE_DP;
-export const MAX_HOLDINGS = 50; // /api/watchlist prices at most 50 tickers per request
+export const MAX_HOLDINGS = MAX_WATCHLIST; // holdings are priced through /api/watchlist
 export const TICKER_RE = /^[A-Z0-9.-]{1,10}$/;
 
 const pow10 = (n) => 10n ** BigInt(n);

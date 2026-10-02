@@ -110,6 +110,7 @@ frontend/
   src/api.js         axios wrappers for /api/*
   src/components/    one component per panel
   src/lib/portfolio.js  portfolio P&L math (fixed-point BigInt)
+  src/lib/limits.js  limits mirrored from the backend (watchlist cap)
   scripts/           node:test checks for the portfolio math (npm test)
   vite.config.js     dev/preview server and /api proxy
 docs/                detailed documentation

@@ -27,7 +27,7 @@ const impColor = {
   LOW: 'var(--text-muted)',
 };
 
-function EarningsTab({ earnings, ticker, loading }) {
+function EarningsTab({ earnings, ticker, loading, error }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)', fontSize: '11px' }}>
       LOADING EARNINGS...
@@ -40,7 +40,7 @@ function EarningsTab({ earnings, ticker, loading }) {
   );
   if (!earnings || earnings.length === 0) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', fontSize: '11px' }}>
-      NO EARNINGS DATA
+      {error ? <span style={{ color: 'var(--amber-dim)', textAlign: 'center', padding: '0 12px', textTransform: 'uppercase' }}>{error}</span> : 'NO EARNINGS DATA'}
     </div>
   );
 
@@ -137,7 +137,7 @@ function MacroTab({ events, loading }) {
   );
 }
 
-export default function CalendarPanel({ earnings, macroEvents, ticker, loadingEarnings, loadingMacro }) {
+export default function CalendarPanel({ earnings, macroEvents, ticker, loadingEarnings, loadingMacro, earningsError }) {
   const [tab, setTab] = useState('macro');
 
   const tabStyle = (active) => ({
@@ -156,7 +156,7 @@ export default function CalendarPanel({ earnings, macroEvents, ticker, loadingEa
       <div style={{ flex: 1, minHeight: 0 }}>
         {tab === 'macro'
           ? <MacroTab events={macroEvents} loading={loadingMacro} />
-          : <EarningsTab earnings={earnings} ticker={ticker} loading={loadingEarnings} />
+          : <EarningsTab earnings={earnings} ticker={ticker} loading={loadingEarnings} error={earningsError} />
         }
       </div>
     </div>

@@ -93,7 +93,9 @@ This matters because every open browser tab polls `/api/quote/{ticker}` every 2 
 
 If Polygon still answers 429, for example because a restart wiped the local window count, the backend treats its window as full (`_request_times = [now] * RATE_LIMIT`) and retries once through the queue. A second 429 becomes a 503.
 
-Upstream requests use `httpx` with a 15 s timeout.
+Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing is cached. The slot the attempt used still counts against the minute.
+
+`/api/health` reports a `data` field (`live` / `eod` / `unknown`) from local state: `eod` while `snapshot` is in the denial memo, and `live` after a successful upstream `snapshot`-family call since startup (`_last_live_snapshot`, cleared when snapshots are denied). It never calls Polygon.
 
 ## End-of-day fallback
 
@@ -115,8 +117,9 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 
 - **Parallel loading:** selecting a ticker fires news, chart, ticker details, financials, options and earnings at once. The quote loads alongside them. The backend queue does the pacing. News is fired first so it gets the earliest slot.
 - **Abort on ticker switch:** each ticker gets an `AbortController`. Switching tickers aborts the previous one's requests, which lets the backend drop them from its queue (the 499 path). Responses for a ticker the user has already left are also ignored.
-- **Retry on 503:** `withBusyRetry` retries a 503 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. Other errors show at once.
-- **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". The exception is the EARNINGS tab, which doesn't show errors yet (see Known limitations).
+- **Abort on timeframe change:** the chart has its own `AbortController`. Each chart load aborts the previous one, and the ticker's controller aborts it too. Bars are applied only if the response belongs to the newest load and still matches the current ticker and timeframe, so a slow older timeframe can't overwrite a newer one.
+- **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. Other errors show at once.
+- **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab.
 - **Polling cadence:**
 
 | What | Interval | Notes |
@@ -124,7 +127,7 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 | Quote for the active ticker | 2 s | A tick is skipped if the previous poll is still pending. The backend caches for 10 s, so this costs at most 6 upstream calls a minute, and none in EOD mode |
 | Watchlist / PORT holdings | 15 s | One batched `/api/watchlist` request. Only the visible monitor tab polls |
 | Gainers / losers | 60 s | Only while that tab is open |
-| `/api/health` | 10 s | Drives the LIVE / DISCONNECTED indicator |
+| `/api/health` | 10 s | Drives the top-bar indicator: LIVE, EOD DATA, CONNECTED (freshness unknown) or DISCONNECTED |
 | Economic events | once at page load | Generated locally by the backend, so it costs no quota |
 
 ## Quota budget on the free tier
@@ -138,7 +141,7 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 ## State and persistence
 
 - The backend keeps all state in process memory: caches, the denial memo, the rate-limit window and the queue. Restarting `bbg-api` clears all of it. There is no database.
-- The frontend stores the watchlist (`bbg.watchlist`) and portfolio holdings (`bbg.portfolio`, as exact decimal strings) in `localStorage`. Portfolio valuation is a pure client-side calculation in `frontend/src/lib/portfolio.js`. The method is described in [DATA-SOURCES.md](DATA-SOURCES.md#portfolio-pl-methodology).
+- The frontend stores the watchlist (`bbg.watchlist`, at most 50 symbols; longer saved lists are trimmed on load) and portfolio holdings (`bbg.portfolio`, as exact decimal strings) in `localStorage`. Portfolio valuation is a pure client-side calculation in `frontend/src/lib/portfolio.js`. The method is described in [DATA-SOURCES.md](DATA-SOURCES.md#portfolio-pl-methodology).
 
 ## Time zones
 
@@ -149,10 +152,8 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 
 ## Known limitations
 
-- Unexpected upstream failures, such as an `httpx` timeout or a network error, aren't caught and reach the client as a generic 500.
-- `/api/watchlist` quietly drops symbols that fail its pattern and caps the list at 50. The UI doesn't cap the watchlist, so symbols past 50 show as `---`.
+- `/api/watchlist` quietly drops symbols that fail its pattern and caps the list at 50. The WATCH tab enforces the same cap (`MAX_WATCHLIST` in `backend/main.py`, mirrored in `frontend/src/lib/limits.js`), so the two must be changed together.
+- The top-bar `EOD DATA` / `LIVE` state reflects the most recent upstream snapshot outcome, so after a 403 denial expires it shows `CONNECTED` until the next quote, watchlist or movers request re-checks it.
 - The `updated` field uses different units by source: EOD rows carry the bar's epoch milliseconds, while live rows pass Polygon's snapshot `updated` through unchanged (nanoseconds in Polygon's snapshot format). The UI doesn't read it.
 - On the free tier, the 1D chart covers yesterday and today in UTC, so it can be empty on weekends and early on Mondays.
-- Changing the chart timeframe doesn't abort the previous timeframe's request. If an older response arrives after a newer one, it can briefly overwrite the chart.
-- The EARNINGS tab doesn't show the backend's `error` message. When financials are unavailable it says "NO EARNINGS DATA".
 - The docstring of `_macro_events` says "next 12 months", but the code returns −90 to +180 days.
