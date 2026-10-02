@@ -1,0 +1,359 @@
+# API Reference
+
+The backend is a FastAPI app (`backend/main.py`). Every data endpoint lives under `/api` and returns JSON.
+
+| Environment | Base URL |
+|---|---|
+| Local dev | `http://localhost:8000` |
+| Production | `https://bloomberg-api.adityatotlani.ch` |
+| From the browser app | relative `/api/...`, proxied by Vite (see [ARCHITECTURE.md](ARCHITECTURE.md)) |
+
+FastAPI also serves interactive docs at `/docs` (Swagger UI) and the OpenAPI schema at `/openapi.json`. `GET /` returns a `307` redirect to `/docs`.
+
+There is no authentication. The Polygon API key stays on the server.
+
+> The examples below are real responses from the production API, captured on 2026-10-02 on the free plan, so quotes are `"source": "eod"`. They're trimmed: long arrays are cut to one or two items, marked `…`. They are point-in-time samples, not reference data.
+
+## Contents
+
+- [Conventions](#conventions)
+- [Errors](#errors)
+- [Caching and quota cost](#caching-and-quota-cost)
+- Endpoints: [health](#get-apihealth) · [search](#get-apisearch) · [quote](#get-apiquoteticker) · [watchlist](#get-apiwatchlist) · [movers](#get-apimoversdirection) · [aggs](#get-apiaggsticker) · [options](#get-apioptionsticker) · [news](#get-apinewsticker) · [financials](#get-apifinancialsticker) · [earnings](#get-apiearningsticker) · [economic-events](#get-apieconomic-events) · [ticker-details](#get-apiticker-detailsticker)
+
+## Conventions
+
+- **Tickers** in the path are case-insensitive and are upper-cased by the server. Only `/api/watchlist` validates their format, against `^[A-Z0-9.\-]{1,10}$`.
+- **Prices and amounts** are JSON numbers in USD, as Polygon returns them. Missing values are `null`.
+- **Timestamps:** bar and EOD `t`/`updated` values are Unix epoch **milliseconds** (UTC). News `published_utc` is an ISO-8601 UTC string. `/api/health` `time` is a naive ISO string in UTC.
+- **Volumes** from Polygon's aggregates can be fractional (for example `36306346.557309`).
+- **`source`** on quote objects is `"live"` (Polygon snapshot) or `"eod"` (built from end-of-day daily bars). See [DATA-SOURCES.md](DATA-SOURCES.md).
+
+## Errors
+
+FastAPI errors have the shape `{"detail": ...}`.
+
+| Status | When | Example `detail` |
+|---|---|---|
+| `400` | Bad `direction` on `/api/movers`, or no valid symbols on `/api/watchlist` | `"direction must be 'gainers' or 'losers'"` / `"No valid tickers supplied"` |
+| `422` | A required query parameter is missing or has the wrong type (FastAPI validation), for example `/api/search` without `q` | `[{"type": "missing", "loc": ["query","q"], "msg": "Field required", ...}]` |
+| `403` / `410` *(degraded, usually not seen)* | The plan isn't entitled (403), or the endpoint is in a deprecation brownout (410). For the `snapshot`, `options` and `financials` families the backend **catches** this and degrades instead of failing. Quotes, watchlist and movers fall back to EOD. Options, financials and earnings return **200** with an `error` string and an empty list. Endpoints outside those families (search, aggs, news, ticker-details) pass Polygon's status and body through unchanged. | Polygon's JSON error body, as a string |
+| `404` | EOD quote fallback found no daily bars for the ticker | `"No data for XYZ"` |
+| `499` | The request was waiting in the rate-limit queue and every client waiting on it disconnected. This is non-standard. Clients never actually receive it, but it shows in the logs as `Dropped queued upstream call ...`. | `"Client disconnected"` |
+| `500` | Unhandled failure, for example an upstream network timeout (httpx, 15 s) | — |
+| `503` | No upstream slot within 75 s (`MAX_QUEUE_WAIT`), Polygon answered 429 twice, or the EOD table couldn't find two recent sessions | `"Data provider rate limit busy — retry shortly"` |
+
+**Clients should retry 503s.** The frontend retries up to 4 attempts in total, 3 s apart.
+
+## Caching and quota cost
+
+All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute (free tier: 5). Responses are cached in memory by URL and parameters, and identical concurrent requests are coalesced into one upstream call. A cached response costs no quota. A denied family (403 for 30 min, 410 for 5 min) also costs none while the denial is remembered.
+
+| Endpoint | Cache TTL | Upstream requests on a miss | Denial family |
+|---|---|---|---|
+| `/api/health` | — | 0 | — |
+| `/api/economic-events` | — (computed) | 0 | — |
+| `/api/search` | 1 h | 1 | — |
+| `/api/quote/{t}` | 10 s live; EOD 10 min | live: 1. EOD: 0 if the market table is warm, else 1 | `snapshot` |
+| `/api/watchlist` | 10 s live; EOD 10 min | live: 1 for the whole batch. EOD: 0 if warm, else 3 to build the market table | `snapshot` |
+| `/api/movers/{d}` | 10 s live; EOD 10 min | live: 1. EOD: as watchlist | `snapshot` |
+| `/api/aggs/{t}` | 60 s for 1D/5D (minute bars); 10 min otherwise | 1 | — |
+| `/api/options/{t}` | 60 s | 1 | `options` |
+| `/api/news/{t}` | 5 min | 1 | — |
+| `/api/financials/{t}` | 1 h | 1, **shared with `/api/earnings`** (identical upstream parameters) | `financials` |
+| `/api/earnings/{t}` | 1 h | shared with `/api/financials` | `financials` |
+| `/api/ticker-details/{t}` | 1 h | 1 | — |
+
+---
+
+## `GET /api/health`
+
+Liveness check. It doesn't touch Polygon, and the UI's LIVE indicator polls it.
+
+```json
+{"status": "ok", "time": "2026-10-02T08:29:44.767618"}
+```
+
+## `GET /api/search`
+
+Ticker autocomplete, backed by Polygon `/v3/reference/tickers` (active US stocks, at most 10 results).
+
+| Query | Type | Required | Notes |
+|---|---|---|---|
+| `q` | string | yes | Minimum length 1. Matches ticker or company name |
+
+`GET /api/search?q=apple`
+
+```json
+{
+  "results": [
+    {"ticker": "AAPL", "name": "Apple Inc.", "market": "stocks", "type": "CS"},
+    {"ticker": "AAPX", "name": "T-Rex 2X Long Apple Daily Target ETF", "market": "stocks", "type": "ETF"}
+    …
+  ]
+}
+```
+
+## `GET /api/quote/{ticker}`
+
+A single quote. It tries Polygon's live snapshot first. If the plan isn't entitled (401/403/410), it falls back to EOD (`_eod_single_quote`).
+
+| Field | Meaning |
+|---|---|
+| `price` | Live: last trade, else last minute-bar close, else day close, else previous close. EOD: the last session's close |
+| `change`, `change_pct` | `price − prev_close` and that as a % of `prev_close`, rounded to 4 dp. Both are `0` if `prev_close` is unknown |
+| `open`, `high`, `low`, `close`, `volume`, `vwap` | Live: today's session, falling back to the previous day's values. EOD: the last session |
+| `bid`, `ask`, `bid_size`, `ask_size` | Live NBBO from the snapshot. Always `null` in EOD mode |
+| `prev_close` | Close of the session before |
+| `min_open`, `min_close` | Live only: the latest minute bar |
+| `updated` | Live: Polygon's snapshot `updated` value. EOD: the bar timestamp (epoch ms) |
+| `source` | `"live"` or `"eod"` |
+
+`GET /api/quote/AAPL` (EOD)
+
+```json
+{
+  "ticker": "AAPL", "price": 330.32, "change": -2.7, "change_pct": -0.8108,
+  "open": 330, "high": 332.4816, "low": 325.81, "close": 330.32,
+  "volume": 36306346.557309, "vwap": 329.6008,
+  "bid": null, "ask": null, "bid_size": null, "ask_size": null,
+  "prev_close": 333.02, "updated": 1790884800000, "source": "eod"
+}
+```
+
+## `GET /api/watchlist`
+
+Quotes for many tickers in a single upstream request. The monitor's WATCH and PORT tabs use it.
+
+| Query | Type | Required | Notes |
+|---|---|---|---|
+| `tickers` | comma-separated string | yes | Symbols are upper-cased and de-duplicated. Symbols that don't match `^[A-Z0-9.\-]{1,10}$` are **silently dropped**. Capped at the first **50**. `400` if none are valid |
+
+The response keeps the caller's order. A symbol with no data comes back as `{"ticker": X, "price": null}`. Each quote has the same shape as `/api/quote`.
+
+`GET /api/watchlist?tickers=SPY,AAPL,ZZZZQ`
+
+```json
+{
+  "quotes": [
+    {"ticker": "SPY", "price": 763.99, "change": 1.36, "change_pct": 0.1783, "prev_close": 762.63, "source": "eod", …},
+    {"ticker": "AAPL", "price": 330.32, "change": -2.7, "change_pct": -0.8108, "prev_close": 333.02, "source": "eod", …},
+    {"ticker": "ZZZZQ", "price": null}
+  ]
+}
+```
+
+## `GET /api/movers/{direction}`
+
+The day's top 20 gainers or losers.
+
+| Path | Values |
+|---|---|
+| `direction` | `gainers` or `losers` (case-insensitive). Anything else returns `400` |
+
+- **Live** (`source: "live"`): Polygon's snapshot gainers or losers list, first 20, unfiltered.
+- **EOD** (`source: "eod"`): ranks the whole-market EOD table by `change_pct`, keeping only stocks with price ≥ $5, volume ≥ 1,000,000 and a known previous close.
+
+`GET /api/movers/gainers`
+
+```json
+{
+  "direction": "gainers",
+  "source": "eod",
+  "movers": [
+    {"ticker": "NXL", "price": 7.55, "change": 3.27, "change_pct": 76.4019, "prev_close": 4.28,
+     "volume": 62336586.517206, "source": "eod", …}
+    …
+  ]
+}
+```
+
+## `GET /api/aggs/{ticker}`
+
+OHLCV bars for the chart, from Polygon `/v2/aggs/ticker/{t}/range/...` (adjusted, ascending, at most 5000 bars).
+
+| Query | Default | Notes |
+|---|---|---|
+| `timeframe` | `1D` | Selects bar size and range (table below). Unknown values fall back to daily bars over 30 days |
+| `from`, `to` | derived | `YYYY-MM-DD`. Override the range start and end |
+| `multiplier`, `timespan` | `1`, `day` | **Accepted but ignored.** The bar size always comes from `timeframe` |
+
+| `timeframe` | Bar size | Range (UTC dates) | Cache |
+|---|---|---|---|
+| `1D` | 1 minute | yesterday → today | 60 s |
+| `5D` | 5 minutes | 5 days ago → today | 60 s |
+| `1M` | 1 day | 30 days ago → today | 10 min |
+| `3M` | 1 day | 90 days ago → today | 10 min |
+| `1Y` | 1 week | 365 days ago → today | 10 min |
+
+Bar fields: `t` (bar start, epoch ms UTC), `o`, `h`, `l`, `c`, `v`, `vw` (VWAP).
+
+`GET /api/aggs/AAPL?timeframe=1M`
+
+```json
+{
+  "ticker": "AAPL",
+  "timeframe": "1M",
+  "bars": [
+    {"t": 1788321600000, "o": 326.865, "h": 328.4, "l": 323.53, "c": 324.96, "v": 33776370.489241, "vw": 325.2771},
+    {"t": 1788408000000, "o": 324.87, "h": 330.81, "l": 324.11, "c": 328.21, "v": 37225838.643891, "vw": 328.1567}
+    …
+  ]
+}
+```
+
+## `GET /api/options/{ticker}`
+
+The options chain snapshot from Polygon `/v3/snapshot/options/{t}`, sorted by strike. **It requires the Polygon Options add-on.**
+
+| Query | Default | Notes |
+|---|---|---|
+| `limit` | `40` | Contracts to fetch |
+| `strike_price_gte`, `strike_price_lte` | — | Optional strike bounds. A value of `0` is ignored |
+
+Contract fields: `contract_type` (`call`/`put`), `strike_price`, `expiration_date`, `bid`, `ask`, `mid`, `iv` (decimal, so 0.25 means 25%), `delta`, `gamma`, `theta`, `vega`, `open_interest`, `volume`.
+
+Without the add-on (the current production response), the status is still `200`:
+
+```json
+{"ticker": "AAPL", "options": [], "error": "Options data requires Polygon Options Add-on"}
+```
+
+## `GET /api/news/{ticker}`
+
+Recent news tagged with the ticker, newest first, from Polygon `/v2/reference/news`.
+
+| Query | Default |
+|---|---|
+| `limit` | `10` |
+
+`GET /api/news/AAPL?limit=3`
+
+```json
+{
+  "ticker": "AAPL",
+  "news": [
+    {
+      "id": "c5577f836e19cffd48604622dfbc66983afec2507c2616021b91a1cd31b13237",
+      "title": "Tesla Is the Only Magnificent Seven Stock in the Red for 2026",
+      "author": "Daniel Sparks",
+      "published_utc": "2026-10-02T02:37:01Z",
+      "article_url": "https://www.fool.com/investing/2026/10/01/tesla-is-the-only-magnificent-seven-stock-in-the-red-for-2026/?source=iedfolrf0000001",
+      "publisher": "The Motley Fool",
+      "description": "Tesla is the only Magnificent Seven stock declining in 2026, …",
+      "tickers": ["TSLA", "AAPL", "NVDA", "MSFT", "GOOG", "GOOGL", …]
+    }
+    …
+  ]
+}
+```
+
+## `GET /api/financials/{ticker}`
+
+The last 4 reported periods (newest first) from Polygon's **experimental, deprecated** `/vX/reference/financials`. The backend fetches 8 filings, sorted by `filing_date` descending, so that it shares the upstream call with `/api/earnings`, and returns the first 4.
+
+| Field | Polygon source |
+|---|---|
+| `fiscal_period`, `fiscal_year`, `filing_date` | filing metadata (`fiscal_period` is e.g. `Q3`, `FY`) |
+| `revenues`, `net_income`, `eps`, `diluted_eps`, `gross_profit`, `operating_income` | income statement (`revenues`, `net_income_loss`, `basic_earnings_per_share`, `diluted_earnings_per_share`, `gross_profit`, `operating_income_loss`) |
+| `total_assets`, `total_liabilities`, `equity`, `long_term_debt` | balance sheet |
+| `operating_cash_flow` | cash flow statement, `net_cash_flow_from_operating_activities` |
+
+`GET /api/financials/AAPL`
+
+```json
+{
+  "ticker": "AAPL",
+  "financials": [
+    {
+      "fiscal_period": "Q3", "fiscal_year": "2026", "filing_date": "2026-07-31",
+      "revenues": 109417000000.0, "net_income": 29789000000.0,
+      "eps": 2.03, "diluted_eps": 2.02,
+      "gross_profit": 54770000000.0, "operating_income": 35695000000.0,
+      "total_assets": 383266000000.0, "total_liabilities": 275746000000.0,
+      "equity": 107520000000.0, "long_term_debt": 82300000000.0,
+      "operating_cash_flow": 34369000000.0
+    }
+    …
+  ]
+}
+```
+
+When the endpoint is denied or in a brownout, the status is still `200`:
+
+```json
+{"ticker": "AAPL", "financials": [], "error": "Financials unavailable on current Polygon plan"}
+```
+
+## `GET /api/earnings/{ticker}`
+
+Up to 8 recent filings with EPS and revenue. It uses the same upstream call and cache entry as `/api/financials`.
+
+Fields: `fiscal_period`, `fiscal_year`, `filing_date`, `start_date`, `end_date`, `eps` (basic), `revenues`.
+
+```json
+{
+  "ticker": "AAPL",
+  "earnings": [
+    {"fiscal_period": "Q3", "fiscal_year": "2026", "filing_date": "2026-07-31",
+     "start_date": "2026-03-29", "end_date": "2026-06-27", "eps": 2.03, "revenues": 109417000000.0}
+    …
+  ]
+}
+```
+
+These are *reported* results by filing date. There are no consensus estimates and no upcoming earnings dates. When denied, the response is `{"ticker": ..., "earnings": [], "error": "Earnings data unavailable on current Polygon plan"}`.
+
+## `GET /api/economic-events`
+
+The macro calendar, generated in the backend (`_macro_events`). It makes no upstream request. It covers events from **90 days ago to 180 days ahead** (UTC dates), sorted by date.
+
+| Field | Values |
+|---|---|
+| `date` | `YYYY-MM-DD` |
+| `event` | e.g. `FOMC Rate Decision`, `FOMC Rate Decision + SEP`, `CPI Inflation Report`, `Non-Farm Payrolls`, `GDP Advance Estimate Q3 2026`. Estimated dates end in ` (est.)` |
+| `category` | `FED` or `ECON` |
+| `importance` | `HIGH`, or `MED` for GDP second and third estimates |
+| `estimated` | `true` only on rule-based estimates. The field is absent otherwise |
+
+```json
+{
+  "events": [
+    {"date": "2026-10-02", "event": "Non-Farm Payrolls", "category": "ECON", "importance": "HIGH"},
+    {"date": "2026-10-14", "event": "CPI Inflation Report", "category": "ECON", "importance": "HIGH"},
+    {"date": "2026-10-28", "event": "FOMC Rate Decision", "category": "FED", "importance": "HIGH"},
+    {"date": "2026-10-29", "event": "GDP Advance Estimate Q3 2026", "category": "ECON", "importance": "HIGH"},
+    …
+    {"date": "2027-01-08", "event": "Non-Farm Payrolls (est.)", "category": "ECON", "importance": "HIGH", "estimated": true},
+    {"date": "2027-01-27", "event": "FOMC Rate Decision", "category": "FED", "importance": "HIGH"},
+    …
+  ]
+}
+```
+
+Sources and estimation rules are in [DATA-SOURCES.md](DATA-SOURCES.md#economic-calendar).
+
+## `GET /api/ticker-details/{ticker}`
+
+Company reference data from Polygon `/v3/reference/tickers/{t}`.
+
+`GET /api/ticker-details/AAPL`
+
+```json
+{
+  "ticker": "AAPL",
+  "name": "Apple Inc.",
+  "description": "Apple is among the largest companies in the world, …",
+  "market_cap": 4820749537600.0,
+  "share_class_shares_outstanding": 14594180000,
+  "weighted_shares_outstanding": 14594180000,
+  "primary_exchange": "XNAS",
+  "type": "CS",
+  "currency_name": "usd",
+  "homepage_url": "https://www.apple.com",
+  "list_date": "1980-12-12",
+  "sic_description": "ELECTRONIC COMPUTERS"
+}
+```
+
+An unknown ticker passes Polygon's error status through, since this endpoint has no fallback.

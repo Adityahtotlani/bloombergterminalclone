@@ -1,16 +1,41 @@
-# React + Vite
+# Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React 19 + Vite UI for the Bloomberg Terminal clone. Project-level docs are in the root [README](../README.md) and [`docs/`](../docs/). Start with the [User Guide](../docs/USER-GUIDE.md) and [Architecture](../docs/ARCHITECTURE.md).
 
-Currently, two official plugins are available:
+## Scripts
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Requires Node.js 20.19+ or 22.12+ (the Vite 8 requirement).
 
-## React Compiler
+| Command | What it does |
+|---|---|
+| `npm install` | Install dependencies |
+| `npm run dev` | Dev server on port 5173 with hot reload |
+| `npm run build` | Production build into `dist/` |
+| `npm run preview` | Serve `dist/` (how production runs, via the `bbg-web` systemd unit) |
+| `npm run lint` | ESLint |
+| `npm test` | Node's built-in test runner over `scripts/` (portfolio math checks) |
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The app calls relative `/api/...` URLs. Vite proxies them to `API_PROXY_TARGET`, which defaults to `http://localhost:8000`, so the backend must be running:
 
-## Expanding the ESLint configuration
+```bash
+API_PROXY_TARGET=http://127.0.0.1:8010 npm run dev   # point at a backend on another port
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+From the project root, `./start.sh` starts the backend and this dev server together.
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `src/App.jsx` | Page layout, per-ticker loading (parallel requests, abort on ticker switch, 503 retry), 2 s quote polling, health check |
+| `src/api.js` | axios wrappers for every `/api/*` endpoint ([API reference](../docs/API.md)) |
+| `src/components/TopBar.jsx` | Ticker search (F1), world clocks, LIVE indicator |
+| `src/components/QuotePanel.jsx` | Quote, session stats, company info, EOD label |
+| `src/components/ChartPanel.jsx` | lightweight-charts candlestick and volume chart with timeframe buttons |
+| `src/components/OptionsPanel.jsx`, `NewsPanel.jsx`, `FinancialsPanel.jsx`, `CalendarPanel.jsx` | Bottom-row panels |
+| `src/components/MonitorPanel.jsx` | WATCH / GAINERS / LOSERS / PORT tabs |
+| `src/lib/portfolio.js` | Pure portfolio P&L math, using fixed-point BigInt ([methodology](../docs/DATA-SOURCES.md#portfolio-pl-methodology)) |
+| `scripts/test-portfolio.mjs` | `node:test` checks for `portfolio.js` |
+| `vite.config.js` | Dev and preview server, `/api` proxy, allowed hosts |
+
+Browser storage: `localStorage` keys `bbg.watchlist` and `bbg.portfolio`.

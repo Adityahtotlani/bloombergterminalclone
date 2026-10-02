@@ -1,0 +1,197 @@
+# Operations Runbook
+
+How the production instance runs and how to deploy, observe and fix it. Commands assume a shell on the production server. Drop `sudo` if you're already root.
+
+## Production topology
+
+| Public URL | Cloudflare Tunnel → | systemd unit | Process |
+|---|---|---|---|
+| <https://bloomberg.adityatotlani.ch> | `http://127.0.0.1:5173` | `bbg-web` | `vite preview` of the built frontend. Proxies `/api` to `127.0.0.1:8010` |
+| <https://bloomberg-api.adityatotlani.ch> | `http://127.0.0.1:8010` | `bbg-api` | `uvicorn main:app` (FastAPI). `/` redirects to `/docs` |
+| — | — | `cloudflared-bloomberg` | The Cloudflare Tunnel that publishes both hostnames |
+
+Both app services listen on **127.0.0.1 only**. They're reachable from outside only through the tunnel, and no inbound ports are open for them.
+
+> **Port 8000 on this server belongs to an unrelated service.** Production uses **8010** for the API. Don't run `start.sh` on the server: it starts a second backend on 8000 and a dev server on 5173, and both collide.
+
+## The services
+
+Unit files live in `/etc/systemd/system/`.
+
+### `bbg-api`
+
+- Working directory: the project's `backend/` folder.
+- Runs `/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8010`.
+- Uses the **system Python**, not `backend/.venv`, so the packages in `backend/requirements.txt` must be installed for `/usr/bin/python3`. The versions installed there can differ from the pins in `requirements.txt`. For example, the server currently has FastAPI 0.115.6 while `requirements.txt` pins 0.111.0.
+- Reads `backend/.env` at startup (`POLYGON_API_KEY`, `POLYGON_RATE_LIMIT`).
+- `Restart=always`, `RestartSec=5`.
+
+### `bbg-web`
+
+- Working directory: the project's `frontend/` folder.
+- `Environment=API_PROXY_TARGET=http://127.0.0.1:8010`.
+- `ExecStartPre=/usr/bin/npm run build`: **the frontend is rebuilt on every start or restart**, so a restart deploys frontend changes. If the build fails, the service doesn't start.
+- `ExecStart=/usr/bin/npx vite preview --host 127.0.0.1 --port 5173 --strictPort`. `--strictPort` means it fails rather than moving to another port if 5173 is taken.
+- `vite preview` inherits `server.proxy` and `server.allowedHosts` from `frontend/vite.config.js`. `allowedHosts` must include `bloomberg.adityatotlani.ch`, or Vite rejects requests for that host.
+- Ordered `After=bbg-api.service`. `Restart=always`, `RestartSec=5`.
+
+### `cloudflared-bloomberg`
+
+- Runs `cloudflared tunnel ... run` for a named tunnel, with a config file referenced in the unit file. That config's ingress rules map `bloomberg-api.adityatotlani.ch` → `http://127.0.0.1:8010` and `bloomberg.adityatotlani.ch` → `http://127.0.0.1:5173`, and everything else to 404.
+- The tunnel's credentials and ID live outside the repo, are deliberately not documented here, and must never be committed.
+- `Restart=always`, `RestartSec=10`. Logs go to the journal.
+
+## Health checks
+
+```bash
+systemctl status bbg-api bbg-web cloudflared-bloomberg --no-pager
+
+# backend direct, and through the frontend's proxy
+curl -s http://127.0.0.1:8010/api/health
+curl -s http://127.0.0.1:5173/api/health
+
+# public, through the tunnel
+curl -s https://bloomberg-api.adityatotlani.ch/api/health
+curl -s -o /dev/null -w '%{http_code}\n' https://bloomberg.adityatotlani.ch/
+```
+
+`/api/health` and `/api/economic-events` cost no upstream quota, so use them for checks. Don't put data endpoints in tight monitoring loops, because every uncached call uses one of the 5 requests per minute.
+
+## Deploying
+
+The code on the server *is* the working copy at the project root. To deploy:
+
+1. Update the code: pull or commit the change into the project folder on the server.
+2. If `frontend/package.json` dependencies changed, run `cd frontend && npm install`. If `backend/requirements.txt` changed, install it for the system Python used by `bbg-api`.
+3. Restart both app services. This also rebuilds the frontend:
+
+   ```bash
+   sudo systemctl restart bbg-api bbg-web
+   ```
+
+4. Verify:
+
+   ```bash
+   systemctl is-active bbg-api bbg-web
+   journalctl -u bbg-web -n 30 --no-pager      # build output and "Local: http://127.0.0.1:5173/"
+   curl -s http://127.0.0.1:8010/api/health
+   ```
+
+Notes:
+
+- Backend-only change: `sudo systemctl restart bbg-api` is enough. Frontend-only change: `sudo systemctl restart bbg-web`.
+- Restarting `bbg-api` **clears every in-memory cache, the denial memo and the rate-limit window**. The first few minutes afterwards cost more upstream requests: the EOD market table has to be rebuilt, and Polygon may answer 429 once because it still counts requests from before the restart. Both are handled, but panels are slower for a minute or two. Avoid restarting repeatedly.
+- The project is kept identical in the monorepo (`Adityahtotlani/projects`, folder `bloombergterminalclone/`) and the standalone repo (`Adityahtotlani/bloombergterminalclone`). Push changes to both.
+
+## Logs
+
+```bash
+journalctl -u bbg-api -f                 # backend: access log and warnings
+journalctl -u bbg-web -f                 # frontend build output and vite proxy errors
+journalctl -u cloudflared-bloomberg -f   # tunnel connection status
+journalctl -u bbg-api --since "1 hour ago" | grep -E "denied|429|Dropped"
+```
+
+Backend warnings worth knowing:
+
+| Log line | Meaning |
+|---|---|
+| `POLYGON_API_KEY is not set — copy backend/.env.example to backend/.env` | The key is missing at startup. Every upstream call will fail |
+| `Polygon denied snapshot (403); skipping for 1800s` | Normal on the free tier: no live snapshots, so EOD fallback is used for 30 min before probing again |
+| `Polygon denied options (403); skipping for 1800s` | Normal on the free tier: no options add-on |
+| `Polygon denied financials (410); skipping for 300s` | The vX financials brownout is active. It's retried after 5 min |
+| `Polygon returned 429 for ...; backing off` | Polygon's window is fuller than the local count (usually just after a restart). It's retried once |
+| `Dropped queued upstream call ...: all clients disconnected` | A user switched tickers or closed the tab while the call was queued. Harmless; it frees a slot |
+| `[vite] http proxy error: /api/... ECONNREFUSED 127.0.0.1:8010` (bbg-web) | The backend was down or restarting when the frontend proxied a request |
+
+The backend never logs the API key. Keep it that way: don't add logging of upstream URLs with their query strings, because the key travels as the `apiKey` query parameter.
+
+## Rotating the Polygon API key
+
+1. Create a new key in the Polygon/Massive dashboard.
+2. Edit `backend/.env` on the server and replace the value of `POLYGON_API_KEY=`. Don't paste the key into commits, issues, chat or shell history you share. `backend/.env` is git-ignored, so keep it that way.
+3. Restart the backend:
+
+   ```bash
+   sudo systemctl restart bbg-api
+   ```
+
+4. Verify: `journalctl -u bbg-api -n 20 --no-pager` shows no "not set" warning. Then load a ticker in the app. An `ECON` calendar alone doesn't prove anything, because it needs no key.
+5. Revoke the old key in the dashboard.
+
+For local development, copy `backend/.env.example` to `backend/.env` and add your own key. `start.sh` does the copy for you.
+
+## Upgrading the data plan / changing the rate limit
+
+The backend paces itself to `POLYGON_RATE_LIMIT` requests per minute (default 5, matching the free tier).
+
+1. Upgrade the plan in the Polygon/Massive dashboard. Add the Options add-on if you want the options chain.
+2. Edit `backend/.env`:
+
+   ```bash
+   POLYGON_RATE_LIMIT=100   # set to what your plan allows; paid stock plans are effectively unlimited
+   ```
+
+   Setting it **higher than the plan allows** just turns local queueing into Polygon 429s, which the backend handles but more slowly. Setting it **lower** wastes capacity.
+3. `sudo systemctl restart bbg-api`. The restart also clears the 403 denial memo, so live snapshots and options are tried straight away instead of after up to 30 minutes.
+4. Check that quotes now return `"source": "live"`, and that the **EOD · DELAYED** label is gone:
+
+   ```bash
+   curl -s https://bloomberg-api.adityatotlani.ch/api/quote/AAPL | grep -o '"source":"[a-z]*"'
+   ```
+
+No code change is needed: live snapshots, the options chain and live movers activate automatically once the key is entitled.
+
+## Troubleshooting
+
+### Panels are slow or stuck on LOADING
+
+Expected to some degree on the free tier. One ticker switch needs about 4–5 upstream requests, and the whole app gets 5 per minute, shared by **every visitor**.
+
+- See how busy the queue is: `journalctl -u bbg-api --since "10 min ago" | grep -c "GET /api/"`, or watch for `Dropped queued upstream call`.
+- Rapid ticker switching is the usual cause. Abandoned calls are dropped, but already-sent calls still count against the minute.
+- If it's constant, upgrade the plan and raise `POLYGON_RATE_LIMIT` (above).
+
+### "Data provider rate limit busy — retry shortly" (503)
+
+A request waited more than 75 s for a slot, even after the browser's own retries. Same causes as above. The queue drains by itself within a minute or two. To see which endpoints are being hit most (for example a script hammering a data endpoint):
+
+```bash
+journalctl -u bbg-api --since "10 min ago" | grep "GET /api/" | awk '{print $10}' | sort | uniq -c | sort -rn | head
+```
+
+Client IPs in the access log are not useful here. Public traffic arrives through the local tunnel.
+
+### Data panel shows "unavailable" or "requires add-on"
+
+- `Options data requires Polygon Options Add-on`: the plan lacks options. Expected on the free tier.
+- `Financials unavailable on current Polygon plan` or `Earnings data unavailable…`: usually a temporary 410 brownout of the deprecated `vX` financials endpoint. It retries after 5 minutes. If it becomes permanent, Polygon has retired the endpoint, and `get_financials` / `get_earnings` in `backend/main.py` need porting to its replacement.
+
+### Site shows DISCONNECTED, or the public URL errors
+
+1. `systemctl status bbg-api bbg-web cloudflared-bloomberg --no-pager`.
+2. Local checks: `curl -s http://127.0.0.1:8010/api/health` and `curl -s http://127.0.0.1:5173/api/health`.
+   - Both fail: `bbg-api` is down. Read `journalctl -u bbg-api -n 50`. Common causes are a Python import error after a deploy, or a missing package for the system Python.
+   - 8010 works but 5173 doesn't: `bbg-web` is down, often because the `npm run build` in `ExecStartPre` failed. Read `journalctl -u bbg-web -n 80`.
+3. Both local checks work but the public URL fails (Cloudflare error page, e.g. 502 or 530): the tunnel is down. Run `sudo systemctl restart cloudflared-bloomberg`, then `journalctl -u cloudflared-bloomberg -n 50` to look for registered connections or auth errors.
+4. The app loads but shows "Blocked request. This host (...) is not allowed": the hostname is missing from `server.allowedHosts` in `frontend/vite.config.js`.
+
+### Port conflicts
+
+```bash
+ss -ltnp | grep -E ':(8000|8010|5173)\b'
+```
+
+- **8000** belongs to another service on this server. Leave it alone.
+- **8010** must be held only by `bbg-api`'s python3 process, and **5173** only by `bbg-web`'s node process. If something else holds them (for example a stray `npm run dev` or `start.sh`), stop it. `bbg-web` uses `--strictPort` and keeps restart-looping until 5173 is free.
+- To move the API to another port, change `--port` in `bbg-api.service`, `API_PROXY_TARGET` in `bbg-web.service`, and the tunnel ingress. Then run `sudo systemctl daemon-reload && sudo systemctl restart bbg-api bbg-web cloudflared-bloomberg`.
+
+### Economic calendar looks stale or ends early
+
+The dates are hard-coded and need a yearly update. See [DATA-SOURCES.md → Yearly update procedure](DATA-SOURCES.md#yearly-update-procedure).
+
+### Changes don't appear after deploy
+
+- Frontend: `bbg-web` only rebuilds when it **restarts**. Check `systemctl show bbg-web -p ActiveEnterTimestamp` to see when it last started.
+- Backend: `bbg-api` doesn't auto-reload. Restart it.
+- Browser: hard-refresh to drop the cached `index.html` and assets.
