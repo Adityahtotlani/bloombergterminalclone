@@ -6,6 +6,7 @@ import {
   formatAmount, formatPrice, formatQty, MAX_HOLDINGS, QTY_DP, PRICE_DP,
 } from '../lib/portfolio';
 import { MAX_WATCHLIST } from '../lib/limits';
+import { errorText } from '../lib/errors';
 
 const STORAGE_KEY = 'bbg.watchlist';
 const PORTFOLIO_KEY = 'bbg.portfolio';
@@ -52,7 +53,8 @@ function usePolling(fetcher, ms, enabled) {
         const result = await fetcher();
         if (!cancelled) { setData(result); setError(null); }
       } catch (e) {
-        if (!cancelled) setError(e?.response?.data?.detail || 'REQUEST FAILED');
+        // Keep the last good data on screen; the error only shows while there is none.
+        if (!cancelled) setError(errorText(e));
       } finally {
         if (!cancelled && initial) setLoading(false);
       }

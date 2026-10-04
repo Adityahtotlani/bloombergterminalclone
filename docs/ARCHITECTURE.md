@@ -97,6 +97,8 @@ If Polygon still answers 429, for example because a restart wiped the local wind
 
 Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing is cached. The slot the attempt used still counts against the minute.
 
+Any other non-200 answer that isn't a 429, an auth failure or a 403/410 denial (for example a 5xx, or a 404 for an unknown symbol) keeps its status, but its `detail` is replaced with `"Data provider error (HTTP <status>)"` (plus " — retry shortly" for 5xx), and the backend logs `Polygon returned HTTP <status> for <path>`. Polygon's body is neither logged nor sent to the client. A non-error status (e.g. an unfollowed 3xx) becomes a 502. The order matters: `_is_auth_failure` reads the body first (to catch `"Unknown API Key"`), and 403/410 still carry Polygon's body because endpoints only inspect their status (`_is_denied`) to degrade.
+
 ### 6. Data mode (`/api/health`)
 
 `/api/health` reports a `data` field from local state only; it never calls Polygon.
@@ -131,6 +133,7 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 - **Abort on timeframe change:** the chart has its own `AbortController`. Each chart load aborts the previous one, and the ticker's controller aborts it too. Bars are applied only if the response belongs to the newest load and still matches the current ticker and timeframe, so a slow older timeframe can't overwrite a newer one.
 - **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. Other errors show at once.
 - **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab.
+- **Error text:** every panel, including the MONITOR tabs (`MonitorPanel.jsx`), turns a failed request into text with `errorText()` in `frontend/src/lib/errors.js`: the backend's `detail` when it is a plain message, otherwise `REQUEST FAILED` (never a raw JSON body, a validation array or an empty value). The MONITOR tabs keep showing their last good data when a later poll fails, and show the error only while they have no data; the next interval simply polls again.
 - **Polling cadence:**
 
 | What | Interval | Notes |

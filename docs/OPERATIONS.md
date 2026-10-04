@@ -108,6 +108,7 @@ Backend warnings worth knowing:
 | `Polygon request timed out for ... (ReadTimeout)` | Polygon didn't answer within 15 s. The client got a 504 |
 | `Polygon request failed for ... (ConnectError)` | Polygon couldn't be reached (network, DNS or TLS). The client got a 502 |
 | `Polygon returned invalid JSON for ...` | Polygon answered 200 with a non-JSON body. The client got a 502 |
+| `Polygon returned HTTP 500 for ...` (any unexpected status) | Polygon answered a status the backend has no special handling for (5xx, or e.g. 404 for an unknown symbol). The client got the same status with `Data provider error (HTTP <status>)`. Repeated 5xx usually mean a provider incident |
 | `[vite] http proxy error: /api/... ECONNREFUSED 127.0.0.1:8010` (bbg-web) | The backend was down or restarting when the frontend proxied a request |
 
 The backend never logs the API key. Keep it that way: don't add logging of upstream URLs with their query strings, because the key travels as the `apiKey` query parameter.

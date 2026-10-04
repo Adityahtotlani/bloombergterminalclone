@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = logging.getLogger("bbg")
+# httpx logs full request URLs at INFO, and ours carry the API key in the query string.
+# Keep it at WARNING so turning up root logging can never leak the key.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API_KEY = os.getenv("POLYGON_API_KEY", "")
 if not API_KEY:
@@ -305,14 +308,24 @@ async def _fetch_upstream(
             logger.error("Polygon rejected the API key (401) for %s", label)
         _auth_error_at = time.time()
         raise HTTPException(status_code=401, detail=AUTH_ERROR_DETAIL)
-    if resp.status_code != 200:
-        if family and resp.status_code in (403, 410):
+    if resp.status_code in (403, 410):
+        # Plan denial / deprecation: endpoints inspect the status (`_is_denied`) and degrade.
+        if family:
             denial_ttl = DENIAL_TTL[resp.status_code]
             _denied[family] = (time.time() + denial_ttl, resp.status_code, resp.text)
             if family == "snapshot":
                 _record_mode("eod")
             logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    if resp.status_code != 200:
+        # Anything else unexpected (5xx, 404 for an unknown symbol, ...): keep the status but
+        # replace Polygon's raw body with a short message. Log only the status and path — never
+        # the body or the full URL (its query string holds the API key). Not cached.
+        # A non-error status (e.g. an unfollowed 3xx) is reported as a 502.
+        logger.warning("Polygon returned HTTP %s for %s", resp.status_code, label)
+        status = resp.status_code if resp.status_code >= 400 else 502
+        retry = " — retry shortly" if status >= 500 else ""
+        raise HTTPException(status_code=status, detail=f"Data provider error (HTTP {resp.status_code}){retry}")
 
     _auth_error_at = None  # any successful upstream response proves the key works
 

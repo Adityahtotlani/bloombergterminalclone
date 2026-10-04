@@ -111,7 +111,8 @@ frontend/
   src/components/    one component per panel
   src/lib/portfolio.js  portfolio P&L math (fixed-point BigInt)
   src/lib/limits.js  limits mirrored from the backend (watchlist cap)
-  scripts/           node:test checks for the portfolio math (npm test)
+  src/lib/errors.js  errorText(): panel message for a failed request
+  scripts/           node:test checks for the portfolio math and error text (npm test)
   vite.config.js     dev/preview server and /api proxy
 docs/                detailed documentation
 start.sh             local dev launcher

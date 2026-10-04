@@ -39,6 +39,7 @@ FastAPI errors have the shape `{"detail": ...}`.
 | `400` | Bad `direction` on `/api/movers`, or no valid symbols on `/api/watchlist` | `"direction must be 'gainers' or 'losers'"` / `"No valid tickers supplied"` |
 | `422` | A required query parameter is missing or has the wrong type (FastAPI validation), for example `/api/search` without `q` | `[{"type": "missing", "loc": ["query","q"], "msg": "Field required", ...}]` |
 | `403` / `410` *(degraded, usually not seen)* | The plan isn't entitled (403), or the endpoint is in a deprecation brownout (410). For the `snapshot`, `options` and `financials` families the backend **catches** this and degrades instead of failing. Quotes, watchlist and movers fall back to EOD. Options, financials and earnings return **200** with an `error` string and an empty list. Endpoints outside those families (search, aggs, news, ticker-details) pass Polygon's status and body through unchanged. | Polygon's JSON error body, as a string |
+| Other upstream status, e.g. `404` / `500` | Polygon answered a status not covered by another row (for example 404 for an unknown symbol on ticker-details, or a 5xx). The status is passed through (a non-error status such as an unfollowed 3xx becomes `502`). Polygon's body is **replaced** with a short message and logged only as status + path. Not cached or memoised | `"Data provider error (HTTP 404)"` / `"Data provider error (HTTP 500) — retry shortly"` (5xx adds "— retry shortly") |
 | `404` | EOD quote fallback found no daily bars for the ticker | `"No data for XYZ"` |
 | `499` | The request was waiting in the rate-limit queue and every client waiting on it disconnected. This is non-standard. Clients never actually receive it, but it shows in the logs as `Dropped queued upstream call ...`. | `"Client disconnected"` |
 | `502` | Polygon couldn't be reached (connection refused, DNS or TLS failure, dropped connection, or another `httpx` request error), or it answered 200 with a body that isn't valid JSON | `"Data provider unreachable — retry shortly"` / `"Data provider sent an invalid response — retry shortly"` |
@@ -378,4 +379,4 @@ Company reference data from Polygon `/v3/reference/tickers/{t}`.
 }
 ```
 
-An unknown ticker passes Polygon's error status through, since this endpoint has no fallback.
+An unknown ticker passes Polygon's error status through (usually 404, with `detail` `"Data provider error (HTTP 404)"`), since this endpoint has no fallback.

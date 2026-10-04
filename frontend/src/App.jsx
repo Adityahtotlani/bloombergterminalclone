@@ -7,17 +7,11 @@ import NewsPanel from './components/NewsPanel';
 import FinancialsPanel from './components/FinancialsPanel';
 import CalendarPanel from './components/CalendarPanel';
 import MonitorPanel from './components/MonitorPanel';
+import { errorText } from './lib/errors';
 import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails, getEarnings, getEconomicEvents } from './api';
 import './App.css';
 
 const DATA_MODES = new Set(['live', 'eod', 'auth_error']);
-// Message for a failed request: the backend's `detail` when it is a short human message
-// (our own errors), else a generic one — never a raw upstream JSON body.
-const errorText = (e) => {
-  const detail = e?.response?.data?.detail;
-  return typeof detail === 'string' && detail && !detail.trimStart().startsWith('{') ? detail : 'REQUEST FAILED';
-};
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // Transient backend answers worth retrying: rate-limit queue full (503), provider
