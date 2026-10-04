@@ -96,7 +96,6 @@ export default function App() {
   const tickerAbort = useRef(null);
   // Aborts the previous chart request when the timeframe (or ticker) changes.
   const chartAbort = useRef(null);
-  const quotePending = useRef(false);
 
   useEffect(() => {
     const check = async () => {
@@ -140,15 +139,20 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  const loadQuote = useCallback(async (t) => {
+  // `signal` is the ticker's AbortController signal, so a ticker switch cancels the request.
+  const loadQuote = useCallback(async (t, signal) => {
+    // A response for a ticker the user has left (initial load or a poll) must not touch state.
+    const isCurrent = () => !signal?.aborted && currentTicker.current === t;
     try {
-      const res = await getQuote(t);
+      const res = await getQuote(t, { signal });
+      if (!isCurrent()) return;
       setQuote(res.data);
       setConnected(true);
       setPanelErrors(p => (p.quote ? { ...p, quote: undefined } : p));
     } catch (e) {
+      if (!isCurrent()) return;
       console.error('Quote error:', e);
-      if (currentTicker.current === t) setPanelErrors(p => ({ ...p, quote: errorText(e) }));
+      setPanelErrors(p => ({ ...p, quote: errorText(e) }));
     }
   }, []);
 
@@ -222,23 +226,31 @@ export default function App() {
     tickerAbort.current?.abort();
     const controller = new AbortController();
     tickerAbort.current = controller;
+    const { signal } = controller;
+    // Stop the previous ticker's quote polling now, not after this ticker's first quote.
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    intervalRef.current = null;
 
     // Kick off the slower panels immediately rather than after the quote arrives.
-    loadStaticData(t, controller.signal);
+    loadStaticData(t, signal);
 
     setLoadingQuote(true);
     try {
-      await loadQuote(t);
+      await loadQuote(t, signal);
     } finally {
-      if (currentTicker.current === t) setLoadingQuote(false);
+      if (tickerAbort.current === controller) setLoadingQuote(false);
     }
+    // The user switched again while this first quote was loading; that switch owns polling.
+    if (tickerAbort.current !== controller) return;
 
-    if (intervalRef.current) clearInterval(intervalRef.current);
+    // The poll is bound to this ticker and its signal. `pending` is per ticker, so a slow
+    // poll for a previous ticker can't block this one's polls.
+    let pending = false;
     intervalRef.current = setInterval(async () => {
       // Skip this tick if the previous poll is still pending, so slow responses can't pile up.
-      if (!currentTicker.current || quotePending.current) return;
-      quotePending.current = true;
-      try { await loadQuote(currentTicker.current); } finally { quotePending.current = false; }
+      if (pending || signal.aborted) return;
+      pending = true;
+      try { await loadQuote(t, signal); } finally { pending = false; }
     }, 2000);
   }, [loadQuote, loadStaticData]);
 

@@ -3,7 +3,7 @@ import axios from 'axios';
 const client = axios.create({ baseURL: '' });
 
 export const searchTickers = (q) => client.get('/api/search', { params: { q } });
-export const getQuote = (ticker) => client.get(`/api/quote/${ticker}`);
+export const getQuote = (ticker, opts) => client.get(`/api/quote/${ticker}`, opts);
 export const getAggs = (ticker, timeframe, opts) => client.get(`/api/aggs/${ticker}`, { params: { timeframe }, ...opts });
 export const getOptions = (ticker, opts) => client.get(`/api/options/${ticker}`, opts);
 export const getNews = (ticker, opts) => client.get(`/api/news/${ticker}`, opts);

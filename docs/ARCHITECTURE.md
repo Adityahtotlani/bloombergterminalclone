@@ -127,7 +127,7 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 `frontend/src/App.jsx` owns the per-ticker state.
 
 - **Parallel loading:** selecting a ticker fires news, chart, ticker details, financials, options and earnings at once. The quote loads alongside them. The backend queue does the pacing. News is fired first so it gets the earliest slot.
-- **Abort on ticker switch:** each ticker gets an `AbortController`. Switching tickers aborts the previous one's requests, which lets the backend drop them from its queue (the 499 path). Responses for a ticker the user has already left are also ignored.
+- **Abort on ticker switch:** each ticker gets an `AbortController`. Switching tickers aborts the previous one's requests, including its in-flight quote (first load or poll), which lets the backend drop them from its queue (the 499 path). Responses for a ticker the user has already left are also ignored, so a slow quote for the old ticker can't briefly show its price, loading state or error under the new one.
 - **Abort on timeframe change:** the chart has its own `AbortController`. Each chart load aborts the previous one, and the ticker's controller aborts it too. Bars are applied only if the response belongs to the newest load and still matches the current ticker and timeframe, so a slow older timeframe can't overwrite a newer one.
 - **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. Other errors show at once.
 - **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab.
@@ -135,7 +135,7 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 
 | What | Interval | Notes |
 |---|---|---|
-| Quote for the active ticker | 2 s | A tick is skipped if the previous poll is still pending. The backend caches for 10 s, so this costs at most 6 upstream calls a minute, and none in EOD mode |
+| Quote for the active ticker | 2 s | Starts after the ticker's first quote arrives; switching tickers stops the old poll at once. A tick is skipped if that ticker's previous poll is still pending (tracked per ticker, so an old ticker's slow poll can't hold up the new one). The backend caches for 10 s, so this costs at most 6 upstream calls a minute, and none in EOD mode |
 | Watchlist / PORT holdings | 15 s | One batched `/api/watchlist` request. Only the visible monitor tab polls |
 | Gainers / losers | 60 s | Only while that tab is open |
 | `/api/health` | 10 s | Drives the top-bar indicator: LIVE, EOD DATA, API KEY ERROR, CONNECTED (freshness unknown) or DISCONNECTED |
