@@ -200,8 +200,10 @@ An **END-OF-DAY DATA** footer means the prices are last-session closes, so **DAY
 | `NO NEWS DATA` / `NO FINANCIAL DATA` / `NO OPTIONS DATA` / `NO EARNINGS DATA` | The provider returned nothing for this ticker | Try another ticker, e.g. ETFs have no fundamentals |
 | `WATCHLIST FULL (50)` | The watchlist has reached its 50-symbol limit | Remove a symbol to add another |
 | `NO DATA — MARKET MAY BE CLOSED` | The movers list is empty | Check again later |
-| `Data provider error (HTTP 500) — retry shortly` / `Data provider error (HTTP 404)` (capitalised in some panels) | The data provider answered with an unexpected error. A 404 usually means it doesn't know the symbol | For 5xx, retry in a minute. For 404, check the symbol |
-| `REQUEST FAILED` | An unexpected error with no readable reason | Retry. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
+| `Data provider error (HTTP 500) — retry shortly` / `Data provider error (HTTP 404)` (capitalised in some panels) | The data provider answered with an unexpected error. A 404 usually means it doesn't know the symbol. 5xx errors were already retried automatically before the message appeared | For 5xx, re-select the ticker in a minute. For 404, check the symbol |
+| `Data provider: not included in the current data plan (HTTP 403)` | The server's data plan doesn't cover this data (e.g. the chart or news on a restricted plan) | Needs a plan upgrade. Retrying won't help |
+| `Data provider endpoint deprecated or temporarily unavailable (HTTP 410)` | The provider is retiring this service, or it is in a temporary brownout | Try again in a few minutes. If it persists, tell the operator |
+| `REQUEST FAILED` | An unexpected error with no readable reason (the raw response is hidden) | Retry. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
 | `DISCONNECTED` (top right, red) | The backend is unreachable | The server or tunnel is down. See OPERATIONS |
 | `API KEY ERROR` (top right, red) / `Data provider rejected the API key — check POLYGON_API_KEY…` in panels | The data provider rejected the server's API key. Retrying won't help | Tell the operator. See [OPERATIONS.md](OPERATIONS.md#api-key-error-in-the-top-bar) |
 | `---` | That individual value isn't available | — |

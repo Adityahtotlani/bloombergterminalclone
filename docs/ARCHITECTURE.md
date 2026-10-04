@@ -73,7 +73,7 @@ Some calls are tagged with a `family` (`snapshot`, `options` or `financials`). W
 | 403 | 30 min | Plan entitlements don't change minute to minute |
 | 410 | 5 min | Brownouts come and go, so the endpoint is retried sooner |
 
-While a denial is remembered, calls in that family fail at once with the same status and cost no quota. Endpoints catch these failures (`_is_denied`: 403/410) and degrade: quotes switch to EOD, and options and financials return an `error` string.
+While a denial is remembered, calls in that family fail at once with the same status and cost no quota. The memo stores the short client-facing message from `DENIAL_DETAIL` ("Data provider: not included in the current data plan (HTTP 403)" / "Data provider endpoint deprecated or temporarily unavailable (HTTP 410)"), never Polygon's body. Endpoints catch these failures (`_is_denied`: 403/410) and degrade: quotes switch to EOD, and options and financials return an `error` string.
 
 A **401** (Polygon rejected the key) is handled differently, because it affects every family and every fallback would fail the same way. `_is_auth_failure` spots it (a 401, or another status whose body says `"Unknown API Key"`, which is how `vX/reference/financials` answers). The backend sets `_auth_error_at`, raises a 401 with an actionable `detail` instead of Polygon's body, and adds **nothing** to the denial memo, so once the key is fixed and the service restarted, requests go straight upstream. `_is_denied` excludes 401, so no slot is wasted on an EOD fallback that would also fail. Any 200 from Polygon clears `_auth_error_at`.
 
@@ -97,7 +97,11 @@ If Polygon still answers 429, for example because a restart wiped the local wind
 
 Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing is cached. The slot the attempt used still counts against the minute.
 
-Any other non-200 answer that isn't a 429, an auth failure or a 403/410 denial (for example a 5xx, or a 404 for an unknown symbol) keeps its status, but its `detail` is replaced with `"Data provider error (HTTP <status>)"` (plus " — retry shortly" for 5xx), and the backend logs `Polygon returned HTTP <status> for <path>`. Polygon's body is neither logged nor sent to the client. A non-error status (e.g. an unfollowed 3xx) becomes a 502. The order matters: `_is_auth_failure` reads the body first (to catch `"Unknown API Key"`), and 403/410 still carry Polygon's body because endpoints only inspect their status (`_is_denied`) to degrade.
+A 403/410 keeps its status (endpoints in a degrading family inspect it with `_is_denied`), but its `detail` is the fixed `DENIAL_DETAIL` message, so endpoints outside those families (search, aggs, news, ticker-details, the EOD fallback's bar calls) never pass Polygon's body to the client.
+
+Any other non-200 answer that isn't a 429 or an auth failure gets `detail` `"Data provider error (HTTP <status>)"`. A 4xx (for example 404 for an unknown symbol) keeps its status and is not retried by the frontend. A 5xx (500–599), or a non-error status such as an unfollowed 3xx, becomes **502** with " — retry shortly" appended and the original status in the message, so the panels' bounded retry applies. Our own 503 (rate-limit queue) and 504 (timeout) are raised earlier and are unaffected.
+
+For all of these the backend logs `Polygon returned HTTP <status> for <path>` (status and path only, never the body or the query string, which holds the API key), and nothing is cached. The order matters: `_is_auth_failure` reads the body first (to catch `"Unknown API Key"`), before any of this replaces it.
 
 ### 6. Data mode (`/api/health`)
 
@@ -131,9 +135,9 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 - **Parallel loading:** selecting a ticker fires news, chart, ticker details, financials, options and earnings at once. The quote loads alongside them. The backend queue does the pacing. News is fired first so it gets the earliest slot.
 - **Abort on ticker switch:** each ticker gets an `AbortController`. Switching tickers aborts the previous one's requests, including its in-flight quote (first load or poll), which lets the backend drop them from its queue (the 499 path). Responses for a ticker the user has already left are also ignored, so a slow quote for the old ticker can't briefly show its price, loading state or error under the new one.
 - **Abort on timeframe change:** the chart has its own `AbortController`. Each chart load aborts the previous one, and the ticker's controller aborts it too. Bars are applied only if the response belongs to the newest load and still matches the current ticker and timeframe, so a slow older timeframe can't overwrite a newer one.
-- **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. Other errors show at once.
+- **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. That covers upstream 5xx, which the backend maps to 502. Other errors (401, 403, 404, 410) show at once.
 - **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab.
-- **Error text:** every panel, including the MONITOR tabs (`MonitorPanel.jsx`), turns a failed request into text with `errorText()` in `frontend/src/lib/errors.js`: the backend's `detail` when it is a plain message, otherwise `REQUEST FAILED` (never a raw JSON body, a validation array or an empty value). The MONITOR tabs keep showing their last good data when a later poll fails, and show the error only while they have no data; the next interval simply polls again.
+- **Error text:** every panel, including the MONITOR tabs (`MonitorPanel.jsx`), turns a failed request into text with `errorText()` in `frontend/src/lib/errors.js`: the backend's `detail` when it is a plain message, otherwise `REQUEST FAILED` (never a raw JSON body, HTML/markup starting with `<`, a string over 200 characters, a validation array or an empty value). This is defence in depth: the backend already replaces upstream bodies with short messages. The MONITOR tabs keep showing their last good data when a later poll fails, and show the error only while they have no data; the next interval simply polls again.
 - **Polling cadence:**
 
 | What | Interval | Notes |
@@ -169,4 +173,6 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 - `/api/watchlist` quietly drops symbols that fail its pattern and caps the list at 50. The WATCH tab enforces the same cap (`MAX_WATCHLIST` in `backend/main.py`, mirrored in `frontend/src/lib/limits.js`), so the two must be changed together.
 - The `updated` field uses different units by source: EOD rows carry the bar's epoch milliseconds, while live rows pass Polygon's snapshot `updated` through unchanged (nanoseconds in Polygon's snapshot format). The UI doesn't read it.
 - On the free tier, the 1D chart covers yesterday and today in UTC, so it can be empty on weekends and early on Mondays.
+- A ticker-details failure has no visible message: `panelErrors.details` is set but not rendered, so the QUOTE panel's COMPANY rows just stay `---`.
+- Each automatic retry of a 502 (including a mapped upstream 5xx) is a fresh upstream call and uses a rate-limit slot, so during a provider incident one panel can spend up to 4 of the 5 free-tier requests per minute.
 - The docstring of `_macro_events` says "next 12 months", but the code returns −90 to +180 days.

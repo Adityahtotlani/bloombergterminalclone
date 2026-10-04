@@ -108,7 +108,8 @@ Backend warnings worth knowing:
 | `Polygon request timed out for ... (ReadTimeout)` | Polygon didn't answer within 15 s. The client got a 504 |
 | `Polygon request failed for ... (ConnectError)` | Polygon couldn't be reached (network, DNS or TLS). The client got a 502 |
 | `Polygon returned invalid JSON for ...` | Polygon answered 200 with a non-JSON body. The client got a 502 |
-| `Polygon returned HTTP 500 for ...` (any unexpected status) | Polygon answered a status the backend has no special handling for (5xx, or e.g. 404 for an unknown symbol). The client got the same status with `Data provider error (HTTP <status>)`. Repeated 5xx usually mean a provider incident |
+| `Polygon returned HTTP 500 for ...` (any unexpected status) | Polygon answered a status the backend has no special handling for. For a 5xx the client got a **502** `Data provider error (HTTP <status>) — retry shortly` (the browser retries it); for a 4xx (e.g. 404 for an unknown symbol) the same status with `Data provider error (HTTP <status>)`. Repeated 5xx usually mean a provider incident |
+| `Polygon returned HTTP 403 for ...` / `Polygon returned HTTP 410 for ...` | Plan denial / deprecation. The client got the same status with a short fixed message (never Polygon's body). For the `snapshot`, `options` and `financials` families it is followed by a `Polygon denied ...` line and the endpoint degrades instead |
 | `[vite] http proxy error: /api/... ECONNREFUSED 127.0.0.1:8010` (bbg-web) | The backend was down or restarting when the frontend proxied a request |
 
 The backend never logs the API key. Keep it that way: don't add logging of upstream URLs with their query strings, because the key travels as the `apiKey` query parameter.
@@ -173,7 +174,8 @@ Client IPs in the access log are not useful here. Public traffic arrives through
 
 The backend couldn't get an answer from Polygon. The browser already retried a few times before showing the message. Nothing is cached on failure, so the next request tries again.
 
-- Check the log lines: `journalctl -u bbg-api --since "10 min ago" | grep -E "timed out|request failed|invalid JSON"`.
+- A 502 can also be Polygon answering 5xx (message `Data provider error (HTTP 5xx) — retry shortly`).
+- Check the log lines: `journalctl -u bbg-api --since "10 min ago" | grep -E "timed out|request failed|invalid JSON|returned HTTP 5"`.
 - Check that the server itself can reach Polygon: `curl -s -o /dev/null -w '%{http_code}\n' https://api.polygon.io/` (no key, so no quota). Any HTTP status, even 404, means it's reachable. `000` means it isn't.
 - Check Polygon's status page. Repeated 504s across all endpoints usually mean a provider incident. Repeated 502s usually mean a local network or DNS problem.
 - Each failed attempt still uses one of the 5 requests per minute, so panels may be slower to fill afterwards.

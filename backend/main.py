@@ -71,6 +71,12 @@ _request_times: list[float] = []
 # Remembered so we don't burn scarce rate-limit slots re-discovering the denial.
 # 403 = plan entitlement (stable); 410 = deprecation brownout (intermittent, retry sooner).
 DENIAL_TTL = {403: 30 * 60, 410: 5 * 60}
+# Client-facing text for those statuses. Polygon's body (JSON, plain text or an HTML error
+# page) is never passed through, and the denial memo replays this text, not the body.
+DENIAL_DETAIL = {
+    403: "Data provider: not included in the current data plan (HTTP 403)",
+    410: "Data provider endpoint deprecated or temporarily unavailable (HTTP 410)",
+}
 _denied: dict[str, tuple[float, int, str]] = {}
 
 # Quote freshness reported by /api/health, as last-known evidence (mode, observed_at epoch s):
@@ -309,23 +315,31 @@ async def _fetch_upstream(
         _auth_error_at = time.time()
         raise HTTPException(status_code=401, detail=AUTH_ERROR_DETAIL)
     if resp.status_code in (403, 410):
-        # Plan denial / deprecation: endpoints inspect the status (`_is_denied`) and degrade.
+        # Plan denial / deprecation: endpoints in a degrading family inspect the status
+        # (`_is_denied`) and fall back; the rest propagate it. Either way the client sees our
+        # short message, never Polygon's body; log status + path only (as below).
+        detail = DENIAL_DETAIL[resp.status_code]
+        logger.warning("Polygon returned HTTP %s for %s", resp.status_code, label)
         if family:
             denial_ttl = DENIAL_TTL[resp.status_code]
-            _denied[family] = (time.time() + denial_ttl, resp.status_code, resp.text)
+            _denied[family] = (time.time() + denial_ttl, resp.status_code, detail)
             if family == "snapshot":
                 _record_mode("eod")
             logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        raise HTTPException(status_code=resp.status_code, detail=detail)
     if resp.status_code != 200:
-        # Anything else unexpected (5xx, 404 for an unknown symbol, ...): keep the status but
-        # replace Polygon's raw body with a short message. Log only the status and path — never
-        # the body or the full URL (its query string holds the API key). Not cached.
-        # A non-error status (e.g. an unfollowed 3xx) is reported as a 502.
+        # Anything else unexpected (5xx, 404 for an unknown symbol, ...): replace Polygon's raw
+        # body with a short message. Log only the status and path — never the body or the full
+        # URL (its query string holds the API key). Not cached. 4xx keep their status (not
+        # retried by the panels); upstream 5xx and non-error statuses (e.g. an unfollowed 3xx)
+        # become 502 so the panels' bounded retry kicks in. Our own 503 (rate-limit queue) and
+        # 504 (timeout) are raised elsewhere and are unaffected.
         logger.warning("Polygon returned HTTP %s for %s", resp.status_code, label)
-        status = resp.status_code if resp.status_code >= 400 else 502
-        retry = " — retry shortly" if status >= 500 else ""
-        raise HTTPException(status_code=status, detail=f"Data provider error (HTTP {resp.status_code}){retry}")
+        if 400 <= resp.status_code < 500:
+            raise HTTPException(status_code=resp.status_code, detail=f"Data provider error (HTTP {resp.status_code})")
+        raise HTTPException(
+            status_code=502, detail=f"Data provider error (HTTP {resp.status_code}) — retry shortly"
+        )
 
     _auth_error_at = None  # any successful upstream response proves the key works
 
