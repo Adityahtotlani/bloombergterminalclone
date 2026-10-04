@@ -73,7 +73,9 @@ Some calls are tagged with a `family` (`snapshot`, `options` or `financials`). W
 | 403 | 30 min | Plan entitlements don't change minute to minute |
 | 410 | 5 min | Brownouts come and go, so the endpoint is retried sooner |
 
-While a denial is remembered, calls in that family fail at once with the same status and cost no quota. Endpoints catch these failures (`_is_denied`, which also covers 401) and degrade: quotes switch to EOD, and options and financials return an `error` string.
+While a denial is remembered, calls in that family fail at once with the same status and cost no quota. Endpoints catch these failures (`_is_denied`: 403/410) and degrade: quotes switch to EOD, and options and financials return an `error` string.
+
+A **401** (Polygon rejected the key) is handled differently, because it affects every family and every fallback would fail the same way. `_is_auth_failure` spots it (a 401, or another status whose body says `"Unknown API Key"`, which is how `vX/reference/financials` answers). The backend sets `_auth_error_at`, raises a 401 with an actionable `detail` instead of Polygon's body, and adds **nothing** to the denial memo, so once the key is fixed and the service restarted, requests go straight upstream. `_is_denied` excludes 401, so no slot is wasted on an EOD fallback that would also fail. Any 200 from Polygon clears `_auth_error_at`.
 
 ### 3. In-flight coalescing
 
@@ -95,7 +97,16 @@ If Polygon still answers 429, for example because a restart wiped the local wind
 
 Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing is cached. The slot the attempt used still counts against the minute.
 
-`/api/health` reports a `data` field (`live` / `eod` / `unknown`) from local state: `eod` while `snapshot` is in the denial memo, and `live` after a successful upstream `snapshot`-family call since startup (`_last_live_snapshot`, cleared when snapshots are denied). It never calls Polygon.
+### 6. Data mode (`/api/health`)
+
+`/api/health` reports a `data` field from local state only; it never calls Polygon.
+
+- **Sticky last-known evidence** (`_mode_evidence`, a `(mode, observed_at)` pair). `_record_mode("live")` runs when a `snapshot`-family call succeeds upstream, and `_record_mode("eod")` when one gets 403/410. Nothing else changes it. In particular, the denial memo expiring doesn't reset it: that only means the next snapshot request re-probes, and the last evidence stands until then.
+- **Persistence.** `_record_mode` writes `backend/.state.json` (`BBG_STATE_FILE` overrides the path) atomically, via a temp file in the same directory, `fsync` and `os.replace`. It writes when the mode changes, and at most hourly (`STATE_REFRESH`) while it doesn't, so `observed_at` reflects the last confirmation and not the last change. `_load_mode_evidence` reads it at import time and ignores it if it is missing, unreadable, malformed, from the future, or older than `STATE_MAX_AGE` (48 h, since a plan can change while the service is down). A write failure is logged and the in-memory mode still updates. The file contains only the mode and a timestamp.
+- **Auth errors** (`_auth_error_at`, above) take precedence and report `auth_error`. They are memory-only: a restart is how a fixed key gets picked up, so it must start clean.
+- Resolution order in `_data_mode()`: `auth_error` → last live/eod evidence → `unknown`.
+
+The denial memo itself is not persisted, so after a restart the first snapshot request still probes Polygon once (one request) and re-confirms the mode.
 
 ## End-of-day fallback
 
@@ -127,7 +138,7 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 | Quote for the active ticker | 2 s | A tick is skipped if the previous poll is still pending. The backend caches for 10 s, so this costs at most 6 upstream calls a minute, and none in EOD mode |
 | Watchlist / PORT holdings | 15 s | One batched `/api/watchlist` request. Only the visible monitor tab polls |
 | Gainers / losers | 60 s | Only while that tab is open |
-| `/api/health` | 10 s | Drives the top-bar indicator: LIVE, EOD DATA, CONNECTED (freshness unknown) or DISCONNECTED |
+| `/api/health` | 10 s | Drives the top-bar indicator: LIVE, EOD DATA, API KEY ERROR, CONNECTED (freshness unknown) or DISCONNECTED |
 | Economic events | once at page load | Generated locally by the backend, so it costs no quota |
 
 ## Quota budget on the free tier
@@ -153,7 +164,6 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 ## Known limitations
 
 - `/api/watchlist` quietly drops symbols that fail its pattern and caps the list at 50. The WATCH tab enforces the same cap (`MAX_WATCHLIST` in `backend/main.py`, mirrored in `frontend/src/lib/limits.js`), so the two must be changed together.
-- The top-bar `EOD DATA` / `LIVE` state reflects the most recent upstream snapshot outcome, so after a 403 denial expires it shows `CONNECTED` until the next quote, watchlist or movers request re-checks it.
 - The `updated` field uses different units by source: EOD rows carry the bar's epoch milliseconds, while live rows pass Polygon's snapshot `updated` through unchanged (nanoseconds in Polygon's snapshot format). The UI doesn't read it.
 - On the free tier, the 1D chart covers yesterday and today in UTC, so it can be empty on weekends and early on Mondays.
 - The docstring of `_macro_events` says "next 12 months", but the code returns −90 to +180 days.

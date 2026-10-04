@@ -43,6 +43,7 @@ function Clock() {
 const STATUS = {
   live: { label: 'LIVE', color: 'var(--green)', glow: true, title: 'Real-time snapshot quotes' },
   eod: { label: 'EOD DATA', color: 'var(--amber)', glow: true, title: 'Connected — quotes are end-of-day (live snapshots not in the current Polygon plan)' },
+  auth_error: { label: 'API KEY ERROR', color: 'var(--red)', glow: true, title: 'Polygon rejected the API key — check POLYGON_API_KEY in backend/.env and restart bbg-api' },
   unknown: { label: 'CONNECTED', color: 'var(--text-dim)', glow: false, title: 'Connected — data freshness not known yet' },
   down: { label: 'DISCONNECTED', color: 'var(--red)', glow: true, title: 'Backend unreachable' },
 };

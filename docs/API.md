@@ -35,6 +35,7 @@ FastAPI errors have the shape `{"detail": ...}`.
 
 | Status | When | Example `detail` |
 |---|---|---|
+| `401` | Polygon rejected the API key (invalid, revoked or missing). Returned by **every** data endpoint, with no EOD fallback or plan notice, because those would fail the same way. Also detected when Polygon answers another status with an `"Unknown API Key"` body (the `vX` financials endpoint answers 404). It is not cached or memoised, and `/api/health` reports `"data": "auth_error"` until an upstream call succeeds. Not retryable: fix the key and restart the backend | `"Data provider rejected the API key — check POLYGON_API_KEY in backend/.env and restart the backend"` |
 | `400` | Bad `direction` on `/api/movers`, or no valid symbols on `/api/watchlist` | `"direction must be 'gainers' or 'losers'"` / `"No valid tickers supplied"` |
 | `422` | A required query parameter is missing or has the wrong type (FastAPI validation), for example `/api/search` without `q` | `[{"type": "missing", "loc": ["query","q"], "msg": "Field required", ...}]` |
 | `403` / `410` *(degraded, usually not seen)* | The plan isn't entitled (403), or the endpoint is in a deprecation brownout (410). For the `snapshot`, `options` and `financials` families the backend **catches** this and degrades instead of failing. Quotes, watchlist and movers fall back to EOD. Options, financials and earnings return **200** with an `error` string and an empty list. Endpoints outside those families (search, aggs, news, ticker-details) pass Polygon's status and body through unchanged. | Polygon's JSON error body, as a string |
@@ -46,7 +47,7 @@ FastAPI errors have the shape `{"detail": ...}`.
 
 A 502 or 504 is never cached, and every request coalesced onto the failed upstream call gets the same error. The failed attempt still counts against the per-minute quota. Any other unhandled failure would still be a plain `500`.
 
-**Clients should retry 502, 503 and 504.** The frontend retries them up to 4 attempts in total, 3 s apart.
+**Clients should retry 502, 503 and 504.** The frontend retries them up to 4 attempts in total, 3 s apart. It never retries a 401.
 
 ## Caching and quota cost
 
@@ -71,19 +72,29 @@ All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute 
 
 ## `GET /api/health`
 
-Liveness check, plus the backend's current quote freshness. It never calls Polygon, so it costs no quota. The UI's top-bar indicator polls it every 10 s.
+Liveness check, plus the backend's last-known quote freshness. It never calls Polygon and only reads memory, so it is fast and costs no quota. The UI's top-bar indicator polls it every 10 s.
 
 ```json
-{"status": "ok", "time": "2026-10-02T14:38:24.582906", "data": "eod"}
+{"status": "ok", "time": "2026-10-04T13:27:02.130861", "data": "eod", "data_as_of": "2026-10-04T13:23:07.332259"}
 ```
 
 | Field | Meaning |
 |---|---|
 | `status` | Always `"ok"` when the backend answers |
 | `time` | Server time, naive ISO string in UTC |
-| `data` | `"eod"` while the `snapshot` family is in the denial memo (not entitled, so quotes, watchlist and movers are end-of-day). `"live"` once a `snapshot`-family call (quote, watchlist or movers) has succeeded upstream since startup and hasn't been denied since. `"unknown"` before any snapshot call has been made, for example right after a restart, or after a snapshot denial has expired and hasn't been re-checked yet |
+| `data` | One of the values below. `auth_error` takes precedence over the others |
+| `data_as_of` | When the `live`/`eod` evidence was last observed (naive ISO, UTC). It can predate the latest restart. `null` when there is no evidence |
 
-`data` comes from in-memory state only, so it changes only after a data request reaches Polygon. A fresh backend reports `"unknown"` until the first quote, watchlist or movers request.
+| `data` | Meaning |
+|---|---|
+| `"auth_error"` | The last upstream response was Polygon rejecting the API key (401, or an `"Unknown API Key"` body). Nothing works, including the EOD fallback. Cleared by the next successful (200) upstream response, and never persisted |
+| `"live"` | The latest evidence is a successful `snapshot`-family call (quote, watchlist or movers): live snapshot quotes work on this key |
+| `"eod"` | The latest evidence is a `snapshot`-family 403/410: quotes, watchlist and movers are end-of-day |
+| `"unknown"` | No evidence: no snapshot call has reached Polygon since startup, and there was no usable state file |
+
+`live`/`eod` is **last-known evidence** and changes only when a snapshot call reaches Polygon. The 30-minute snapshot denial memo expiring doesn't reset it: it only means the next snapshot request re-probes. A key error with no live/eod evidence behind it still reports `auth_error`; once that clears, `data` falls back to the last live/eod evidence.
+
+**Persistence.** The live/eod evidence is written to `backend/.state.json` (path overridable with the `BBG_STATE_FILE` environment variable) as `{"data_mode": "eod", "observed_at": <epoch seconds>}`. It is written atomically (temp file + rename) when the mode changes, and at most once an hour while it stays the same, so `observed_at` tracks the last confirmation. At startup the file is loaded, so the indicator is correct straight after a restart. The file is ignored (falling back to `"unknown"`) if it's missing, unreadable, malformed, or older than **48 hours**, because the Polygon plan may have changed in the meantime. It holds no secrets and is gitignored. `auth_error` is never written to it, so restarting with a fixed key starts clean.
 
 ## `GET /api/search`
 
@@ -107,7 +118,7 @@ Ticker autocomplete, backed by Polygon `/v3/reference/tickers` (active US stocks
 
 ## `GET /api/quote/{ticker}`
 
-A single quote. It tries Polygon's live snapshot first. If the plan isn't entitled (401/403/410), it falls back to EOD (`_eod_single_quote`).
+A single quote. It tries Polygon's live snapshot first. If the plan isn't entitled (403/410), it falls back to EOD (`_eod_single_quote`). A rejected key (401) is returned as a 401, with no fallback.
 
 | Field | Meaning |
 |---|---|

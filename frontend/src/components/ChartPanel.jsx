@@ -3,7 +3,7 @@ import { createChart, CandlestickSeries, HistogramSeries } from 'lightweight-cha
 
 const TIMEFRAMES = ['1D', '5D', '1M', '3M', '1Y'];
 
-export default function ChartPanel({ bars, timeframe, onTimeframeChange, loading, ticker }) {
+export default function ChartPanel({ bars, timeframe, onTimeframeChange, loading, ticker, error }) {
   const chartRef = useRef(null);
   const containerRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -153,9 +153,11 @@ export default function ChartPanel({ bars, timeframe, onTimeframeChange, loading
         {!bars && !loading && (
           <div style={{
             position: 'absolute', inset: 0, display: 'flex',
-            alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)',
+            alignItems: 'center', justifyContent: 'center', textAlign: 'center', padding: '8px',
+            zIndex: 2, pointerEvents: 'none', // above the chart canvas, which mounts after it
+            color: error ? 'var(--red)' : 'var(--text-muted)', fontSize: error ? '11px' : undefined,
           }}>
-            SELECT A TICKER TO VIEW CHART
+            {error || 'SELECT A TICKER TO VIEW CHART'}
           </div>
         )}
       </div>

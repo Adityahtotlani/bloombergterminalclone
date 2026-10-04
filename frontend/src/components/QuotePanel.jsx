@@ -31,10 +31,16 @@ function Divider({ label }) {
   );
 }
 
-export default function QuotePanel({ quote, details, loading }) {
+export default function QuotePanel({ quote, details, loading, error }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)' }}>
       LOADING...
+    </div>
+  );
+
+  if (!quote && error) return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--red)', fontSize: '11px', textAlign: 'center', padding: '8px' }}>
+      {error}
     </div>
   );
 

@@ -97,6 +97,9 @@ Backend warnings worth knowing:
 | Log line | Meaning |
 |---|---|
 | `POLYGON_API_KEY is not set — copy backend/.env.example to backend/.env` | The key is missing at startup. Every upstream call will fail |
+| `Polygon rejected the API key (401) for ...` | The key is invalid, revoked or missing. Logged once per run of failures (again after a success). The top bar shows **API KEY ERROR**. See below |
+| `Ignoring unreadable state file ...` / `Ignoring invalid state file ...` / `Ignoring stale data-mode evidence ...` | `backend/.state.json` couldn't be used at startup, so the indicator shows CONNECTED until the next quote. Harmless |
+| `Could not write state file ...` | The backend couldn't save the last-known data mode (permissions or disk). The indicator still works until the next restart |
 | `Polygon denied snapshot (403); skipping for 1800s` | Normal on the free tier: no live snapshots, so EOD fallback is used for 30 min before probing again |
 | `Polygon denied options (403); skipping for 1800s` | Normal on the free tier: no options add-on |
 | `Polygon denied financials (410); skipping for 300s` | The vX financials brownout is active. It's retried after 5 min |
@@ -136,7 +139,7 @@ The backend paces itself to `POLYGON_RATE_LIMIT` requests per minute (default 5,
    ```
 
    Setting it **higher than the plan allows** just turns local queueing into Polygon 429s, which the backend handles but more slowly. Setting it **lower** wastes capacity.
-3. `sudo systemctl restart bbg-api`. The restart also clears the 403 denial memo, so live snapshots and options are tried straight away instead of after up to 30 minutes.
+3. `sudo systemctl restart bbg-api`. The restart also clears the 403 denial memo, so live snapshots and options are tried straight away instead of after up to 30 minutes. The top bar keeps showing the remembered **EOD DATA** until the first quote, watchlist or movers request succeeds, then switches to **LIVE**.
 4. Check that quotes now return `"source": "live"`, and that the **EOD · DELAYED** label is gone:
 
    ```bash
@@ -178,6 +181,19 @@ The backend couldn't get an answer from Polygon. The browser already retried a f
 
 - `Options data requires Polygon Options Add-on`: the plan lacks options. Expected on the free tier.
 - `Financials unavailable on current Polygon plan` or `Earnings data unavailable…`: usually a temporary 410 brownout of the deprecated `vX` financials endpoint. It retries after 5 minutes. If it becomes permanent, Polygon has retired the endpoint, and `get_financials` / `get_earnings` in `backend/main.py` need porting to its replacement.
+
+### API KEY ERROR in the top bar
+
+Polygon is rejecting the key in `backend/.env` (invalid, revoked, expired, or missing). Every data panel shows "Data provider rejected the API key — check POLYGON_API_KEY in backend/.env and restart the backend", and retrying won't help.
+
+1. Confirm: `curl -s http://127.0.0.1:8010/api/health` shows `"data":"auth_error"`, and `journalctl -u bbg-api --since "1 hour ago" | grep "rejected the API key"` has entries.
+2. Get a valid key from the Polygon/Massive dashboard (rotate it if the old one may have leaked) and set `POLYGON_API_KEY` in `backend/.env`. Never commit the key or paste it into logs or tickets.
+3. `sudo systemctl restart bbg-api`. The key error isn't remembered across restarts and isn't added to the denial memo, so the new key is used on the very next request.
+4. Load a ticker and check that `/api/health` no longer says `auth_error`.
+
+### Data-mode state file (`backend/.state.json`)
+
+The backend remembers the last-known data mode (`live` or `eod`) and when it saw it in `backend/.state.json`, so the top-bar indicator is right immediately after a restart. It holds only `{"data_mode": ..., "observed_at": ...}`, no secrets, and is gitignored. Entries older than 48 hours are ignored. **Deleting it is always safe**: the indicator shows CONNECTED until the next quote, watchlist or movers request, then the file is recreated. Set `BBG_STATE_FILE` to put it elsewhere, for example for a second test instance running from the same checkout.
 
 ### Site shows DISCONNECTED, or the public URL errors
 

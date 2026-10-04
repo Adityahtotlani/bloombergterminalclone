@@ -52,8 +52,11 @@ Switching tickers cancels the previous ticker's pending requests, so you don't w
   |---|---|
   | **LIVE** (green) | Backend reachable and quotes come from live snapshots |
   | **EOD DATA** (amber) | Backend reachable, but the data plan has no live quotes, so prices are end-of-day. This is the normal state on the free plan |
-  | **CONNECTED** (grey) | Backend reachable, but it hasn't fetched a quote since it started, so freshness isn't known yet. It changes after the next quote loads |
+  | **API KEY ERROR** (red) | Backend reachable, but the data provider rejected its API key, so no data loads (not even end-of-day). Panels show "Data provider rejected the API key…". The server operator needs to fix the key. See [OPERATIONS.md](OPERATIONS.md#api-key-error-in-the-top-bar) |
+  | **CONNECTED** (grey) | Backend reachable, but it has no record of data freshness yet: a fresh install, or the last check is more than 48 hours old. It changes after the next quote loads |
   | **DISCONNECTED** (red) | The browser can't reach the backend |
+
+  LIVE and EOD DATA show the most recent result the backend has seen, and it remembers that result across restarts, so the indicator is correct as soon as the page loads. Hover the indicator for an explanation.
 
   Individual panels also show **EOD · DELAYED** / **END-OF-DAY DATA**, described below.
 
@@ -197,6 +200,7 @@ An **END-OF-DAY DATA** footer means the prices are last-session closes, so **DAY
 | `NO DATA — MARKET MAY BE CLOSED` | The movers list is empty | Check again later |
 | `REQUEST FAILED` or a provider error text | An unexpected error | Retry. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
 | `DISCONNECTED` (top right, red) | The backend is unreachable | The server or tunnel is down. See OPERATIONS |
+| `API KEY ERROR` (top right, red) / `Data provider rejected the API key — check POLYGON_API_KEY…` in panels | The data provider rejected the server's API key. Retrying won't help | Tell the operator. See [OPERATIONS.md](OPERATIONS.md#api-key-error-in-the-top-bar) |
 | `---` | That individual value isn't available | — |
 
 ## Time zones at a glance

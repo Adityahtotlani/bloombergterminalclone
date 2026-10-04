@@ -1,7 +1,9 @@
 import asyncio
 import contextvars
+import json
 import logging
 import os
+import tempfile
 import re
 import time
 from typing import Optional
@@ -67,9 +69,84 @@ _request_times: list[float] = []
 # 403 = plan entitlement (stable); 410 = deprecation brownout (intermittent, retry sooner).
 DENIAL_TTL = {403: 30 * 60, 410: 5 * 60}
 _denied: dict[str, tuple[float, int, str]] = {}
-# When a `snapshot`-family call last succeeded upstream (i.e. live quotes work on this key).
-# Cleared when snapshots get denied; /api/health reports the resulting data mode.
-_last_live_snapshot: Optional[float] = None
+
+# Quote freshness reported by /api/health, as last-known evidence (mode, observed_at epoch s):
+# a `snapshot`-family success means "live", a snapshot 403/410 means "eod". It only changes on
+# new evidence — the denial memo expiring just means we re-probe, so it doesn't reset the mode.
+# Persisted to a small state file so a restart doesn't fall back to "unknown". The file holds
+# only {"data_mode", "observed_at"} — never the API key or anything from upstream responses.
+STATE_FILE = os.getenv("BBG_STATE_FILE") or os.path.join(os.path.dirname(__file__), ".state.json")
+# Persisted evidence older than this is ignored at startup (the Polygon plan may have changed).
+STATE_MAX_AGE = 48 * 3600
+# While the mode is unchanged, refresh the file's timestamp at most this often, so the age
+# check above measures the last confirmation rather than the last change.
+STATE_REFRESH = 3600
+DATA_MODES = ("live", "eod")
+_mode_evidence: Optional[tuple[str, float]] = None
+_persisted_at: float = 0.0
+# Set when Polygon answers 401 (key invalid/revoked/missing), cleared by any 200 response.
+# Memory-only on purpose: restarting with a fixed key must start clean, and it never feeds
+# the denial memo, so requests go straight upstream once the key is fixed.
+_auth_error_at: Optional[float] = None
+AUTH_ERROR_DETAIL = (
+    "Data provider rejected the API key — check POLYGON_API_KEY in backend/.env and restart the backend"
+)
+
+
+def _load_mode_evidence(path: str = None, now: float = None) -> Optional[tuple[str, float]]:
+    """Read persisted last-known data mode; None if missing, unreadable, invalid or stale."""
+    path = path or STATE_FILE
+    now = time.time() if now is None else now
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        mode, observed = state["data_mode"], float(state["observed_at"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        logger.warning("Ignoring unreadable state file %s (%s)", path, type(e).__name__)
+        return None
+    if mode not in DATA_MODES or observed > now + 300:
+        logger.warning("Ignoring invalid state file %s", path)
+        return None
+    if now - observed > STATE_MAX_AGE:
+        logger.info("Ignoring stale data-mode evidence in %s (%.0fh old)", path, (now - observed) / 3600)
+        return None
+    return mode, observed
+
+
+def _persist_mode_evidence(mode: str, observed: float) -> None:
+    """Atomically write the state file (temp file + rename); failures are logged, not raised."""
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"data_mode": mode, "observed_at": observed}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, STATE_FILE)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    except OSError as e:
+        logger.warning("Could not write state file %s (%s)", STATE_FILE, type(e).__name__)
+
+
+def _record_mode(mode: str) -> None:
+    """Record data-mode evidence; persist when it changes (or the file's timestamp is old)."""
+    global _mode_evidence, _persisted_at
+    now = time.time()
+    changed = _mode_evidence is None or _mode_evidence[0] != mode
+    _mode_evidence = (mode, now)
+    if changed or now - _persisted_at > STATE_REFRESH:
+        _persisted_at = now
+        _persist_mode_evidence(mode, now)
+
+
+_mode_evidence = _load_mode_evidence()
+if _mode_evidence:
+    _persisted_at = _mode_evidence[1]
 
 
 # FIFO ticket queue: requests get upstream slots in arrival order, and a request whose
@@ -175,11 +252,25 @@ async def rate_limited_get(
     return await asyncio.shield(flight.task)
 
 
+def _is_auth_failure(resp: httpx.Response) -> bool:
+    """Polygon rejected the key. Usually a 401, but some endpoints answer an unknown key with
+    another status (vX/reference/financials returns 404 {"error": "Unknown API Key"})."""
+    if resp.status_code == 401:
+        return True
+    if resp.status_code == 200:
+        return False
+    try:
+        error = resp.json().get("error")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(error, str) and "unknown api key" in error.lower()
+
+
 async def _fetch_upstream(
     url: str, params: Optional[dict], family: Optional[str],
     store: TTLCache, cache_key: str, flight: _Inflight,
 ) -> dict:
-    global _request_times, _last_live_snapshot
+    global _request_times, _auth_error_at
     full_params = {"apiKey": API_KEY, **(params or {})}
     label = url.replace(BASE_URL, "")
 
@@ -206,14 +297,24 @@ async def _fetch_upstream(
 
     if resp.status_code == 429:
         raise HTTPException(status_code=503, detail="Data provider rate limit busy — retry shortly")
+    if _is_auth_failure(resp):
+        # Bad/revoked/missing key: affects every family, so it is not memoised as a denial.
+        # Replace Polygon's body with an actionable message (the body never holds the key,
+        # but this keeps panels readable).
+        if _auth_error_at is None:
+            logger.error("Polygon rejected the API key (401) for %s", label)
+        _auth_error_at = time.time()
+        raise HTTPException(status_code=401, detail=AUTH_ERROR_DETAIL)
     if resp.status_code != 200:
         if family and resp.status_code in (403, 410):
             denial_ttl = DENIAL_TTL[resp.status_code]
             _denied[family] = (time.time() + denial_ttl, resp.status_code, resp.text)
             if family == "snapshot":
-                _last_live_snapshot = None
+                _record_mode("eod")
             logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    _auth_error_at = None  # any successful upstream response proves the key works
 
     try:
         data = resp.json()
@@ -222,7 +323,7 @@ async def _fetch_upstream(
         raise HTTPException(status_code=502, detail="Data provider sent an invalid response — retry shortly")
     store[cache_key] = data
     if family == "snapshot":
-        _last_live_snapshot = time.time()
+        _record_mode("live")
     return data
 
 
@@ -233,19 +334,25 @@ async def root():
 
 
 def _data_mode() -> str:
-    """Quote freshness from local state only (no upstream call): "eod" while snapshots are
-    denied, "live" once a snapshot succeeded since startup, otherwise "unknown"."""
-    denial = _denied.get("snapshot")
-    if denial and time.time() < denial[0]:
-        return "eod"
-    if _last_live_snapshot is not None:
-        return "live"
+    """Quote freshness from local state only (no upstream call): "auth_error" while Polygon is
+    rejecting the key, else the last-known evidence ("live"/"eod"), else "unknown"."""
+    if _auth_error_at is not None:
+        return "auth_error"
+    if _mode_evidence is not None:
+        return _mode_evidence[0]
     return "unknown"
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat(), "data": _data_mode()}
+    observed = _mode_evidence[1] if _mode_evidence else None
+    return {
+        "status": "ok",
+        "time": datetime.utcnow().isoformat(),
+        "data": _data_mode(),
+        # When the live/eod evidence was last observed (may predate a restart); null if none.
+        "data_as_of": datetime.utcfromtimestamp(observed).isoformat() if observed else None,
+    }
 
 
 @app.get("/api/search")
@@ -303,7 +410,9 @@ def _normalize_snapshot(snap: dict) -> dict:
 
 
 def _is_denied(e: HTTPException) -> bool:
-    return e.status_code in (401, 403, 410)
+    """Plan entitlement (403) or deprecation (410): fall back to EOD / a plan notice. A 401
+    (bad key) is not included — every fallback would fail the same way, so it propagates."""
+    return e.status_code in (403, 410)
 
 
 def _eod_quote(ticker: str, bar: dict, prev_close: Optional[float]) -> dict:

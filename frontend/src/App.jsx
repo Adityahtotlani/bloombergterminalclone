@@ -10,10 +10,18 @@ import MonitorPanel from './components/MonitorPanel';
 import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails, getEarnings, getEconomicEvents } from './api';
 import './App.css';
 
+const DATA_MODES = new Set(['live', 'eod', 'auth_error']);
+// Message for a failed request: the backend's `detail` when it is a short human message
+// (our own errors), else a generic one — never a raw upstream JSON body.
+const errorText = (e) => {
+  const detail = e?.response?.data?.detail;
+  return typeof detail === 'string' && detail && !detail.trimStart().startsWith('{') ? detail : 'REQUEST FAILED';
+};
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // Transient backend answers worth retrying: rate-limit queue full (503), provider
-// unreachable (502) or timed out (504).
+// unreachable (502) or timed out (504). A 401 (API key rejected) is never retried.
 const RETRY_STATUSES = new Set([502, 503, 504]);
 
 /** Retry transient failures a bounded number of times — the panel stays in LOADING. */
@@ -67,7 +75,7 @@ export default function App() {
   const [timeframe, setTimeframe] = useState('1M');
   const timeframeRef = useRef('1M');
   const [connected, setConnected] = useState(false);
-  // Quote freshness reported by /api/health: 'live' | 'eod' | 'unknown'.
+  // Quote freshness reported by /api/health: 'live' | 'eod' | 'auth_error' | 'unknown'.
   const [dataMode, setDataMode] = useState('unknown');
 
   const [loadingQuote, setLoadingQuote] = useState(false);
@@ -94,10 +102,11 @@ export default function App() {
     const check = async () => {
       try {
         const res = await fetch('/api/health');
+        // Read the body before updating state, so reachability and data mode change in one
+        // render (no grey CONNECTED flash between DISCONNECTED and the real mode).
+        const body = res.ok ? await res.json().catch(() => null) : null;
         setConnected(res.ok);
-        if (!res.ok) return;
-        const body = await res.json().catch(() => null);
-        setDataMode(body?.data === 'live' || body?.data === 'eod' ? body.data : 'unknown');
+        if (res.ok) setDataMode(DATA_MODES.has(body?.data) ? body.data : 'unknown');
       } catch {
         setConnected(false);
       }
@@ -136,8 +145,10 @@ export default function App() {
       const res = await getQuote(t);
       setQuote(res.data);
       setConnected(true);
+      setPanelErrors(p => (p.quote ? { ...p, quote: undefined } : p));
     } catch (e) {
       console.error('Quote error:', e);
+      if (currentTicker.current === t) setPanelErrors(p => ({ ...p, quote: errorText(e) }));
     }
   }, []);
 
@@ -157,9 +168,13 @@ export default function App() {
     setLoadingChart(true);
     try {
       const res = await withBusyRetry(() => getAggs(t, tf, { signal }), signal);
-      if (isCurrent() && !signal.aborted) setBars(res.data.bars);
+      if (isCurrent() && !signal.aborted) {
+        setBars(res.data.bars);
+        setPanelErrors(p => (p.chart ? { ...p, chart: undefined } : p));
+      }
     } catch (e) {
       if (!signal.aborted) console.error('Chart error:', e);
+      if (isCurrent() && !signal.aborted) setPanelErrors(p => ({ ...p, chart: errorText(e) }));
     } finally {
       tickerSignal?.removeEventListener('abort', onTickerAbort);
       if (chartAbort.current === controller) setLoadingChart(false);
@@ -181,7 +196,7 @@ export default function App() {
         .catch((e) => {
           if (signal.aborted || currentTicker.current !== t) return;
           console.error(`${name} error:`, e);
-          setPanelErrors(p => ({ ...p, [name]: e?.response?.data?.detail || 'REQUEST FAILED' }));
+          setPanelErrors(p => ({ ...p, [name]: errorText(e) }));
         })
         .finally(() => {
           if (setLoading && currentTicker.current === t) setLoading(false);
@@ -246,7 +261,7 @@ export default function App() {
         <Panel style={{ width: '220px', flexShrink: 0 }}>
           <PanelHeader label="QUOTE" />
           <div style={{ flex: 1, overflow: 'hidden' }}>
-            <QuotePanel quote={quote} details={details} loading={loadingQuote} />
+            <QuotePanel quote={quote} details={details} loading={loadingQuote} error={panelErrors.quote} />
           </div>
         </Panel>
 
@@ -259,6 +274,7 @@ export default function App() {
               onTimeframeChange={handleTimeframeChange}
               loading={loadingChart}
               ticker={ticker}
+              error={panelErrors.chart}
             />
           </Panel>
 
