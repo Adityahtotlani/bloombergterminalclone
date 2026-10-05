@@ -12,6 +12,10 @@ import { getQuote, getAggs, getOptions, getNews, getFinancials, getTickerDetails
 import './App.css';
 
 const DATA_MODES = new Set(['live', 'eod', 'auth_error']);
+// /api/health cadence. While the provider circuit breaker is open (20 s cooldown) poll a
+// little faster, so the PROVIDER ISSUES badge clears soon after the backend recovers.
+const HEALTH_POLL_MS = 10000;
+const HEALTH_POLL_DEGRADED_MS = 5000;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // Transient backend answers worth retrying: rate-limit queue full or provider circuit
@@ -77,6 +81,8 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   // Quote freshness reported by /api/health: 'live' | 'eod' | 'auth_error' | 'unknown'.
   const [dataMode, setDataMode] = useState('unknown');
+  // True while /api/health reports provider: "degraded" (backend circuit breaker open/probing).
+  const [providerDegraded, setProviderDegraded] = useState(false);
 
   const [loadingQuote, setLoadingQuote] = useState(false);
   const [loadingChart, setLoadingChart] = useState(false);
@@ -98,21 +104,40 @@ export default function App() {
   const chartAbort = useRef(null);
 
   useEffect(() => {
+    // Self-scheduling rather than setInterval: the next check is armed only after the
+    // previous one settles (no pile-up if health is slow), and the delay can follow the
+    // provider state. Health reads backend memory only, so it costs no Polygon quota.
+    let timer = null;
+    let cancelled = false;
     const check = async () => {
+      let degraded = false;
       try {
-        const res = await fetch('/api/health');
+        // Bounded, so a hung request can't stall the self-scheduling loop.
+        const res = await fetch('/api/health', { signal: AbortSignal.timeout(8000) });
         // Read the body before updating state, so reachability and data mode change in one
         // render (no grey CONNECTED flash between DISCONNECTED and the real mode).
         const body = res.ok ? await res.json().catch(() => null) : null;
+        if (cancelled) return;
         setConnected(res.ok);
-        if (res.ok) setDataMode(DATA_MODES.has(body?.data) ? body.data : 'unknown');
+        if (res.ok) {
+          setDataMode(DATA_MODES.has(body?.data) ? body.data : 'unknown');
+          // Only an explicit "degraded" counts; a missing field (older backend) means ok.
+          degraded = body?.provider === 'degraded';
+          setProviderDegraded(degraded);
+        } else {
+          setProviderDegraded(false);
+        }
       } catch {
+        if (cancelled) return;
         setConnected(false);
+        setProviderDegraded(false);
+      }
+      if (!cancelled) {
+        timer = setTimeout(check, degraded ? HEALTH_POLL_DEGRADED_MS : HEALTH_POLL_MS);
       }
     };
     check();
-    const id = setInterval(check, 10000);
-    return () => clearInterval(id);
+    return () => { cancelled = true; clearTimeout(timer); };
   }, []);
 
   useEffect(() => {
@@ -266,7 +291,7 @@ export default function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
-      <TopBar onTickerSelect={handleTickerSelect} connected={connected} dataMode={dataMode} />
+      <TopBar onTickerSelect={handleTickerSelect} connected={connected} dataMode={dataMode} providerDegraded={providerDegraded} />
 
       <div style={{ flex: 1, display: 'flex', gap: '2px', padding: '2px', minHeight: 0, overflow: 'hidden' }}>
         {/* Left: quote panel */}

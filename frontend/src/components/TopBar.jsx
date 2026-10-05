@@ -48,7 +48,13 @@ const STATUS = {
   down: { label: 'DISCONNECTED', color: 'var(--red)', glow: true, title: 'Backend unreachable' },
 };
 
-export default function TopBar({ onTickerSelect, connected, dataMode }) {
+// Shown next to the data indicator while /api/health reports provider: "degraded" (the
+// backend's circuit breaker is open or probing). The data indicator stays as it is: the
+// mode it shows (LIVE/EOD) is still true, this only says fresh requests are being paused.
+const PROVIDER_ISSUES_TITLE =
+  'Market data provider is failing — requests are paused briefly and retried automatically. Data shown may be stale.';
+
+export default function TopBar({ onTickerSelect, connected, dataMode, providerDegraded }) {
   const [input, setInput] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [open, setOpen] = useState(false);
@@ -57,6 +63,9 @@ export default function TopBar({ onTickerSelect, connected, dataMode }) {
   const searchCache = useRef(new Map());
   const inputRef = useRef(null);
   const status = !connected ? STATUS.down : STATUS[dataMode] || STATUS.unknown;
+  // Hidden when health itself failed (DISCONNECTED says more) and on API KEY ERROR, which is
+  // the actionable problem; a rejected key never trips the breaker anyway.
+  const showProviderIssues = connected && providerDegraded && dataMode !== 'auth_error';
 
   useEffect(() => {
     const handler = (e) => {
@@ -156,18 +165,35 @@ export default function TopBar({ onTickerSelect, connected, dataMode }) {
 
       <Clock />
 
-      <div
-        title={status.title}
-        style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px' }}
-      >
-        <div style={{
-          width: '8px', height: '8px', borderRadius: '50%',
-          background: status.color,
-          boxShadow: status.glow ? `0 0 6px ${status.color}` : 'none',
-        }} />
-        <span style={{ color: status.color, fontSize: '10px' }}>
-          {status.label}
-        </span>
+      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+        {showProviderIssues && (
+          <span
+            className="provider-issues"
+            role="status"
+            title={PROVIDER_ISSUES_TITLE}
+            aria-label={`Provider issues: ${PROVIDER_ISSUES_TITLE}`}
+            style={{
+              background: 'var(--amber)', color: 'var(--bg)', fontWeight: 'bold',
+              fontSize: '10px', letterSpacing: '1px', padding: '1px 6px',
+              whiteSpace: 'nowrap', cursor: 'help',
+            }}
+          >
+            PROVIDER ISSUES
+          </span>
+        )}
+        <div
+          title={status.title}
+          style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
+        >
+          <div style={{
+            width: '8px', height: '8px', borderRadius: '50%',
+            background: status.color,
+            boxShadow: status.glow ? `0 0 6px ${status.color}` : 'none',
+          }} />
+          <span style={{ color: status.color, fontSize: '10px' }}>
+            {status.label}
+          </span>
+        </div>
       </div>
     </div>
   );

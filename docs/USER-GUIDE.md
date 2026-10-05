@@ -46,7 +46,7 @@ Switching tickers cancels the previous ticker's pending requests, so you don't w
 
 - **Ticker search**, described above. Search results are remembered for the session, so retyping a query is instant.
 - **World clocks:** New York, London and Tokyo, 24-hour, updated every second.
-- **Connection and data indicator** (top right), checked against `/api/health` every 10 s:
+- **Connection and data indicator** (top right), checked against `/api/health` every 10 s (every 5 s while the PROVIDER ISSUES badge below is showing):
 
   | Indicator | Meaning |
   |---|---|
@@ -57,6 +57,12 @@ Switching tickers cancels the previous ticker's pending requests, so you don't w
   | **DISCONNECTED** (red) | The browser can't reach the backend |
 
   LIVE and EOD DATA show the most recent result the backend has seen, and it remembers that result across restarts, so the indicator is correct as soon as the page loads. Hover the indicator for an explanation.
+
+- **PROVIDER ISSUES badge** (blinking amber tag, just left of the indicator). It appears when the market-data provider has failed several times in a row (timeouts, unreachable, server errors on its side). The server then pauses new requests to the provider for about 20 s to protect the shared quota, and tries again on its own. Hover it for the explanation. While it shows:
+  - The indicator next to it is still correct (for example **EOD DATA**): the badge doesn't change what kind of data you're seeing, only that new data can't be fetched right now.
+  - Prices and panels may be **stale**, and panels that load meanwhile may show `DATA PROVIDER HAVING ISSUES — RETRY SHORTLY`.
+  - **What to do:** nothing, usually. The badge disappears by itself within about 5 s of the provider answering again. Then re-select the ticker to reload any panel that gave up. If it stays for many minutes, the provider has an incident; tell the operator ([OPERATIONS.md](OPERATIONS.md#data-provider-incident-data-provider-having-issues)).
+  - It is not shown with **DISCONNECTED** (the server itself can't be reached, so its provider state is unknown) or with **API KEY ERROR** (the key is the problem to fix first). It respects your system's reduce-motion setting: with reduced motion it stays solid instead of blinking.
 
   Individual panels also show **EOD · DELAYED** / **END-OF-DAY DATA**, described below.
 

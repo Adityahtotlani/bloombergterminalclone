@@ -43,3 +43,10 @@ html, body, #root {
 .monitor-row .monitor-remove { visibility: hidden; }
 .monitor-row:hover .monitor-remove { visibility: visible; }
 .monitor-remove:hover { color: var(--red) !important; }
+
+/* Top-bar PROVIDER ISSUES badge: a slow blink, off for users who ask for reduced motion. */
+@keyframes provider-issues-blink { 50% { opacity: 0.45; } }
+.provider-issues { animation: provider-issues-blink 1.6s steps(1, end) infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .provider-issues { animation: none; }
+}

@@ -187,11 +187,11 @@ The backend couldn't get an answer from Polygon. The browser already retried a f
 
 ### Data provider incident ("Data provider having issues")
 
-Panels show `DATA PROVIDER HAVING ISSUES — RETRY SHORTLY` (503). The backend saw three provider failures in a row and opened its circuit breaker. For 20 s it refuses new upstream calls, so retries don't spend the shared quota, and then it sends one probe. It recovers by itself as soon as a probe succeeds; **you don't need to restart anything**, and restarting doesn't help, because Polygon is still down after a restart.
+Users see a blinking amber **PROVIDER ISSUES** badge in the top bar (next to EOD DATA / LIVE), and panels may show `DATA PROVIDER HAVING ISSUES — RETRY SHORTLY` (503). The badge mirrors `/api/health` `"provider":"degraded"` (browsers poll it every 5 s while it lasts, 10 s otherwise), so it is the quickest visual signal that the breaker is open. The backend saw three provider failures in a row and opened its circuit breaker. For 20 s it refuses new upstream calls, so retries don't spend the shared quota, and then it sends one probe. It recovers by itself as soon as a probe succeeds; **you don't need to restart anything**, and restarting doesn't help, because Polygon is still down after a restart.
 
 1. Confirm: `curl -s http://127.0.0.1:8010/api/health` shows `"provider":"degraded"` (it reads local state only and costs no quota). `journalctl -u bbg-api --since "30 min ago" | grep -E "circuit breaker|timed out|request failed|returned HTTP 5|invalid JSON"` shows what is failing.
 2. Work out where the problem is. `curl -s -o /dev/null -w '%{http_code}\n' https://api.polygon.io/` (no key, so no quota): `000` means a local network or DNS problem on this server, and any HTTP status means Polygon is reachable, so the incident is on Polygon's side. Check Polygon's status page.
-3. Wait. While Polygon is down, the probes cost about 3 requests a minute, and only while visitors are using the app. Once a probe succeeds, the log shows `CLOSED` and `/api/health` goes back to `"provider":"ok"`. Panels that already gave up need the ticker re-selected.
+3. Wait. While Polygon is down, the probes cost about 3 requests a minute, and only while visitors are using the app. Once a probe succeeds, the log shows `CLOSED`, `/api/health` goes back to `"provider":"ok"`, and the badge disappears within about 5 s. Panels that already gave up need the ticker re-selected.
 4. If it is local (DNS, firewall, outbound network), fix that. The breaker closes on the next successful probe.
 
 The breaker never opens for 401 (API key), 403/410 (plan or deprecation), 404 or 429, or for the backend's own `rate limit busy` 503. Those have their own sections above.

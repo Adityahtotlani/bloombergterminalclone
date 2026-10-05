@@ -89,7 +89,7 @@ Liveness check, plus the backend's last-known quote freshness. It never calls Po
 | `time` | Server time, naive ISO string in UTC |
 | `data` | One of the values below. `auth_error` takes precedence over the others |
 | `data_as_of` | When the `live`/`eod` evidence was last observed (naive ISO, UTC). It can predate the latest restart. `null` when there is no evidence |
-| `provider` | `"ok"`, or `"degraded"` while the provider circuit breaker is open or probing after repeated provider failures (timeouts, unreachable, upstream 5xx). Data calls then fail fast with 503 `"Data provider having issues — retry shortly"`. Memory-only, so it reads `"ok"` after a restart. The UI doesn't display it yet |
+| `provider` | `"ok"`, or `"degraded"` while the provider circuit breaker is open or probing after repeated provider failures (timeouts, unreachable, upstream 5xx). Data calls then fail fast with 503 `"Data provider having issues — retry shortly"`. Memory-only, so it reads `"ok"` after a restart. The UI shows `"degraded"` as a **PROVIDER ISSUES** badge in the top bar (not with DISCONNECTED or API KEY ERROR) and polls health every 5 s instead of 10 s while it lasts. Anything other than `"degraded"`, including a missing field, is treated as ok |
 
 | `data` | Meaning |
 |---|---|
