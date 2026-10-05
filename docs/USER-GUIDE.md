@@ -72,6 +72,8 @@ Switching tickers cancels the previous ticker's pending requests, so you don't w
 
 The quote refreshes every 2 seconds. Large numbers use K/M/B/T suffixes. `---` means the value isn't available.
 
+Company details load separately from the price. If they can't be loaded, the COMPANY section shows the reason in amber instead of its four rows (for example `DATA PROVIDER ERROR (HTTP 404)` for a symbol the provider doesn't know, or `DATA PROVIDER HAVING ISSUES — RETRY SHORTLY`), and the company name and exchange are left out of the header. The price and session data above stay visible.
+
 ### EOD · DELAYED
 
 When **EOD · DELAYED** appears under the price, the current data plan doesn't include live quotes. The panel then shows the **close of the last completed trading session**, and the change is measured against the session before it. Bid and ask show `---` in this mode. Hover the label for the explanation.
@@ -190,17 +192,18 @@ An **END-OF-DAY DATA** footer means the prices are last-session closes, so **DAY
 
 | Message | Meaning | What to do |
 |---|---|---|
-| `LOADING…` | Waiting for data. On the free plan, requests queue for the shared 5/min quota | Wait. Panels retry on their own (up to 4 tries, 3 s apart) when the provider is busy, unreachable or slow |
+| `LOADING…` | Waiting for data. On the free plan, requests queue for the shared 5/min quota | Wait. Panels retry on their own when the provider is busy, unreachable or slow: up to 4 tries over about 21 s (waiting 3 s, then 6 s, then 12 s) |
 | `ENTER TICKER TO BEGIN` / `SELECT A TICKER TO VIEW CHART` / `ENTER A TICKER` | No ticker loaded yet | Search for one |
 | `EOD · DELAYED` / `END-OF-DAY DATA` | Last completed session's data, not live | Expected on the free plan |
 | `OPTIONS DATA REQUIRES POLYGON OPTIONS ADD-ON` | The plan doesn't include options | Needs a plan upgrade |
 | `FINANCIALS UNAVAILABLE ON CURRENT POLYGON PLAN` / `EARNINGS DATA UNAVAILABLE ON CURRENT POLYGON PLAN` | Plan or deprecation issue with the financials service (often a temporary 410 brownout) | Try again in about 5 minutes |
 | `DATA PROVIDER RATE LIMIT BUSY — RETRY SHORTLY` | The panel waited 75 s and still had no quota slot, even after retries | Re-select the ticker in a minute. Avoid rapid ticker switching |
 | `DATA PROVIDER TIMED OUT — RETRY SHORTLY` / `DATA PROVIDER UNREACHABLE — RETRY SHORTLY` | The data provider didn't answer in 15 s, or couldn't be reached, even after retries | Re-select the ticker in a minute. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |
+| `DATA PROVIDER HAVING ISSUES — RETRY SHORTLY` | The data provider failed several times in a row (an outage or slowdown on its side), so the server pauses requests to it for about 20 s to protect the shared quota, then tries again on its own | Re-select the ticker in a minute. If it lasts, the provider is having an incident; the operator can confirm it ([OPERATIONS.md](OPERATIONS.md#data-provider-incident-data-provider-having-issues)) |
 | `NO NEWS DATA` / `NO FINANCIAL DATA` / `NO OPTIONS DATA` / `NO EARNINGS DATA` | The provider returned nothing for this ticker | Try another ticker, e.g. ETFs have no fundamentals |
 | `WATCHLIST FULL (50)` | The watchlist has reached its 50-symbol limit | Remove a symbol to add another |
 | `NO DATA — MARKET MAY BE CLOSED` | The movers list is empty | Check again later |
-| `Data provider error (HTTP 500) — retry shortly` / `Data provider error (HTTP 404)` (capitalised in some panels) | The data provider answered with an unexpected error. A 404 usually means it doesn't know the symbol. 5xx errors were already retried automatically before the message appeared | For 5xx, re-select the ticker in a minute. For 404, check the symbol |
+| `Data provider error (HTTP 500) — retry shortly` / `Data provider error (HTTP 404)` (capitalised in some panels) | The data provider answered with an unexpected error. A 404 usually means it doesn't know the symbol. 5xx errors were already retried automatically before the message appeared. During a provider problem, a retry within 20 s gets the same message back without asking the provider again | For 5xx, re-select the ticker in a minute. For 404, check the symbol |
 | `Data provider: not included in the current data plan (HTTP 403)` | The server's data plan doesn't cover this data (e.g. the chart or news on a restricted plan) | Needs a plan upgrade. Retrying won't help |
 | `Data provider endpoint deprecated or temporarily unavailable (HTTP 410)` | The provider is retiring this service, or it is in a temporary brownout | Try again in a few minutes. If it persists, tell the operator |
 | `REQUEST FAILED` | An unexpected error with no readable reason (the raw response is hidden) | Retry. If it persists, see [OPERATIONS.md](OPERATIONS.md#troubleshooting) |

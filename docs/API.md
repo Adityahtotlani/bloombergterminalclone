@@ -40,20 +40,23 @@ FastAPI errors have the shape `{"detail": ...}`.
 | `422` | A required query parameter is missing or has the wrong type (FastAPI validation), for example `/api/search` without `q` | `[{"type": "missing", "loc": ["query","q"], "msg": "Field required", ...}]` |
 | `403` / `410` *(degraded, usually not seen)* | The plan isn't entitled (403), or the endpoint is in a deprecation brownout (410). For the `snapshot`, `options` and `financials` families the backend **catches** this and degrades instead of failing. Quotes, watchlist and movers fall back to EOD. Options, financials and earnings return **200** with an `error` string and an empty list. Endpoints outside those families (search, aggs, news, ticker-details, and the EOD fallback's own daily-bars / grouped-daily calls) return the status with a short fixed message. Polygon's body (JSON, plain text or HTML) is never sent to the client or logged, and the denial memo replays the same short message. Not retried by the frontend | `"Data provider: not included in the current data plan (HTTP 403)"` / `"Data provider endpoint deprecated or temporarily unavailable (HTTP 410)"` |
 | Other upstream `4xx`, e.g. `404` | Polygon answered a 4xx not covered by another row (for example 404 for an unknown symbol on ticker-details). The status is passed through. Polygon's body is **replaced** with a short message and logged only as status + path. Not cached or memoised, and not retried by the frontend | `"Data provider error (HTTP 404)"` |
-| Upstream `5xx` → `502` | Polygon answered any 5xx (500–599), or a non-error status such as an unfollowed 3xx. Returned as **502** so clients retry it; the original status is kept in the message. Body replaced and logged as status + path, as above. Not cached or memoised. This is Polygon's 503, not our own rate-limit 503 below | `"Data provider error (HTTP 500) — retry shortly"` / `"Data provider error (HTTP 503) — retry shortly"` |
+| Upstream `5xx` → `502` | Polygon answered any 5xx (500–599), or a non-error status such as an unfollowed 3xx. Returned as **502** so clients retry it; the original status is kept in the message. Body replaced and logged as status + path, as above. Not stored in the success caches; it is negative-cached for 20 s (see below). This is Polygon's 503, not our own 503s below | `"Data provider error (HTTP 500) — retry shortly"` / `"Data provider error (HTTP 503) — retry shortly"` |
 | `404` | EOD quote fallback found no daily bars for the ticker | `"No data for XYZ"` |
 | `499` | The request was waiting in the rate-limit queue and every client waiting on it disconnected. This is non-standard. Clients never actually receive it, but it shows in the logs as `Dropped queued upstream call ...`. | `"Client disconnected"` |
 | `502` | Polygon answered a 5xx (row above), or couldn't be reached (connection refused, DNS or TLS failure, dropped connection, or another `httpx` request error), or it answered 200 with a body that isn't valid JSON | `"Data provider unreachable — retry shortly"` / `"Data provider sent an invalid response — retry shortly"` |
 | `503` | No upstream slot within 75 s (`MAX_QUEUE_WAIT`), Polygon answered 429 twice, or the EOD table couldn't find two recent sessions | `"Data provider rate limit busy — retry shortly"` |
+| `503` (circuit breaker) | The provider circuit breaker is open: 3 provider failures (502/504 class) in a row, so new upstream calls fail fast for 20 s without spending quota. Carries a `Retry-After` header (seconds until the cooldown ends). `/api/health` reports `"provider": "degraded"` meanwhile | `"Data provider having issues — retry shortly"` |
 | `504` | Polygon didn't answer within the 15 s `httpx` timeout | `"Data provider timed out — retry shortly"` |
 
-A 502 or 504 is never cached, and every request coalesced onto the failed upstream call gets the same error. The failed attempt still counts against the per-minute quota. Any other unhandled failure would still be a plain `500`.
+A 502 or 504 is never stored in the success caches, and every request coalesced onto the failed upstream call gets the same error. The failed attempt still counts against the per-minute quota. Any other unhandled failure would still be a plain `500`.
 
-**Clients should retry 502, 503 and 504.** The frontend retries them up to 4 attempts in total, 3 s apart. It never retries a 401, 403, 404 or 410.
+**Provider failures are rationed.** A 502 or 504 that came from the provider (timeout, unreachable, upstream 5xx/3xx, invalid JSON) is **negative-cached for 20 s** per call (same URL and parameters): repeating that call within the window returns the same status and `detail` immediately, with no upstream call. Three provider failures in a row, on any endpoints, open the **circuit breaker** (503 above) for 20 s. After that a single request probes Polygon while the others wait; success closes the breaker (and clears the negative cache), and failure re-opens it. 401, 403, 404, 410, 429 and our own rate-limit 503 never count. Details are in [ARCHITECTURE.md](ARCHITECTURE.md#2b-negative-cache-and-circuit-breaker-provider-failures).
+
+**Clients should retry 502, 503 and 504, with backoff.** The frontend makes up to 4 attempts in total, waiting 3 s, 6 s and then 12 s, so the last attempt comes about 21 s after the first failure, just after the 20 s windows. Retrying faster than that only gets the replayed error. It never retries a 401, 403, 404 or 410.
 
 ## Caching and quota cost
 
-All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute (free tier: 5). Responses are cached in memory by URL and parameters, and identical concurrent requests are coalesced into one upstream call. A cached response costs no quota. A denied family (403 for 30 min, 410 for 5 min) also costs none while the denial is remembered.
+All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute (free tier: 5). Responses are cached in memory by URL and parameters, and identical concurrent requests are coalesced into one upstream call. A cached response costs no quota. A denied family (403 for 30 min, 410 for 5 min) also costs none while the denial is remembered, and neither does a replayed provider failure (20 s) or a circuit-breaker 503.
 
 | Endpoint | Cache TTL | Upstream requests on a miss | Denial family |
 |---|---|---|---|
@@ -77,7 +80,7 @@ All upstream calls share one budget of `POLYGON_RATE_LIMIT` requests per minute 
 Liveness check, plus the backend's last-known quote freshness. It never calls Polygon and only reads memory, so it is fast and costs no quota. The UI's top-bar indicator polls it every 10 s.
 
 ```json
-{"status": "ok", "time": "2026-10-04T13:27:02.130861", "data": "eod", "data_as_of": "2026-10-04T13:23:07.332259"}
+{"status": "ok", "time": "2026-10-04T13:27:02.130861", "data": "eod", "data_as_of": "2026-10-04T13:23:07.332259", "provider": "ok"}
 ```
 
 | Field | Meaning |
@@ -86,6 +89,7 @@ Liveness check, plus the backend's last-known quote freshness. It never calls Po
 | `time` | Server time, naive ISO string in UTC |
 | `data` | One of the values below. `auth_error` takes precedence over the others |
 | `data_as_of` | When the `live`/`eod` evidence was last observed (naive ISO, UTC). It can predate the latest restart. `null` when there is no evidence |
+| `provider` | `"ok"`, or `"degraded"` while the provider circuit breaker is open or probing after repeated provider failures (timeouts, unreachable, upstream 5xx). Data calls then fail fast with 503 `"Data provider having issues — retry shortly"`. Memory-only, so it reads `"ok"` after a restart. The UI doesn't display it yet |
 
 | `data` | Meaning |
 |---|---|
@@ -380,4 +384,4 @@ Company reference data from Polygon `/v3/reference/tickers/{t}`.
 }
 ```
 
-An unknown ticker passes Polygon's error status through (usually 404, with `detail` `"Data provider error (HTTP 404)"`), since this endpoint has no fallback.
+An unknown ticker passes Polygon's error status through (usually 404, with `detail` `"Data provider error (HTTP 404)"`), since this endpoint has no fallback. The UI shows any failure here in the QUOTE panel's COMPANY section, while the price from `/api/quote` stays visible.

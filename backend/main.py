@@ -79,6 +79,31 @@ DENIAL_DETAIL = {
 }
 _denied: dict[str, tuple[float, int, str]] = {}
 
+# Provider-failure protection. A "provider failure" is the 502/504 class: a timeout, an
+# unreachable host, an upstream 5xx (or unfollowed 3xx), or a 200 with an invalid body. Every
+# retry of one is a fresh upstream call, so during an incident they would burn the shared
+# 5 req/min quota. Two layers, both checked before any quota is spent:
+#  1. Negative cache: the failing cache key replays the same error (status + our short detail,
+#     never Polygon's body) for NEGATIVE_TTL seconds instead of calling upstream again.
+#  2. Circuit breaker (global): after BREAKER_THRESHOLD consecutive provider failures it opens
+#     for BREAKER_COOLDOWN seconds, during which new upstream calls fail fast with a 503. After
+#     the cooldown the next call to reach the head of the queue is a single half-open probe
+#     (later calls wait behind it in the queue); any non-failure answer closes the breaker,
+#     another failure re-opens it.
+# Not provider failures (and so never counted): 401/403/404/410/429 and other 4xx (Polygon is
+# answering — those have their own handling), our own rate-limit 503 and the 499 abandon.
+# Both windows equal the frontend's final retry point (~21 s after the first failure, see
+# withBusyRetry in App.jsx), so a panel's last attempt is a real one rather than a replay.
+NEGATIVE_TTL = 20
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN = 20
+BREAKER_DETAIL = "Data provider having issues — retry shortly"
+# cache_key -> (status, detail). TTLCache handles expiry and bounds memory.
+_provider_failed: TTLCache = TTLCache(maxsize=1024, ttl=NEGATIVE_TTL)
+_breaker_failures = 0  # consecutive provider failures
+_breaker_open_until: Optional[float] = None  # None = closed; else open (cooldown end, epoch s)
+_breaker_probing = False  # a half-open probe is in flight
+
 # Quote freshness reported by /api/health, as last-known evidence (mode, observed_at epoch s):
 # a `snapshot`-family success means "live", a snapshot 403/410 means "eod". It only changes on
 # new evidence — the denial memo expiring just means we re-probe, so it doesn't reset the mode.
@@ -175,8 +200,63 @@ def _advance_queue() -> None:
     _slot_cond.notify_all()
 
 
-async def _acquire_slot(should_abandon=None, label: str = "") -> None:
-    """Wait (FIFO) for an upstream slot. `should_abandon` is an async predicate polled while queued."""
+def _breaker_open_error() -> HTTPException:
+    retry_in = max(1, int((_breaker_open_until or time.time()) - time.time() + 0.999))
+    return HTTPException(status_code=503, detail=BREAKER_DETAIL, headers={"Retry-After": str(retry_in)})
+
+
+def _breaker_rejects() -> bool:
+    """Open and still cooling down: new calls fail fast without queueing (no quota spent)."""
+    return _breaker_open_until is not None and not _breaker_probing and time.time() < _breaker_open_until
+
+
+def _breaker_gate(label: str) -> Optional[bool]:
+    """Called by the head of the queue just before it takes a slot. Returns False to proceed
+    normally, True to proceed as the half-open probe, None to wait (a probe is in flight);
+    raises a 503 while the breaker is open."""
+    global _breaker_probing
+    if _breaker_open_until is None:
+        return False
+    if _breaker_probing:
+        return None
+    if time.time() < _breaker_open_until:
+        raise _breaker_open_error()
+    _breaker_probing = True
+    logger.warning("Provider circuit breaker HALF-OPEN: probing with %s", label)
+    return True
+
+
+def _breaker_failure(label: str, reason: str, probe: bool) -> None:
+    """Count a provider failure. `reason` is a status or exception class name — never a body."""
+    global _breaker_failures, _breaker_open_until, _breaker_probing
+    _breaker_failures += 1
+    if probe and _breaker_probing:
+        _breaker_open_until = time.time() + BREAKER_COOLDOWN
+        _breaker_probing = False
+        logger.warning("Provider circuit breaker OPEN: probe failed (%s for %s); failing fast for %ss",
+                       reason, label, BREAKER_COOLDOWN)
+    elif _breaker_open_until is None and _breaker_failures >= BREAKER_THRESHOLD:
+        _breaker_open_until = time.time() + BREAKER_COOLDOWN
+        logger.warning("Provider circuit breaker OPEN after %s consecutive failures (last: %s for %s); "
+                       "failing fast for %ss", _breaker_failures, reason, label, BREAKER_COOLDOWN)
+    # Already open: a straggler that took its slot before the breaker opened. Leave it be.
+
+
+def _breaker_success(label: str, status: int) -> None:
+    """Polygon answered (anything but a provider failure): reset the count, close if open."""
+    global _breaker_failures, _breaker_open_until, _breaker_probing
+    _breaker_failures = 0
+    if _breaker_open_until is not None:
+        _breaker_open_until = None
+        _breaker_probing = False
+        # Other keys' failures were part of the same incident; let them retry straight away.
+        _provider_failed.clear()
+        logger.warning("Provider circuit breaker CLOSED: provider answered HTTP %s for %s", status, label)
+
+
+async def _acquire_slot(should_abandon=None, label: str = "") -> bool:
+    """Wait (FIFO) for an upstream slot. `should_abandon` is an async predicate polled while
+    queued. Returns True if this call is the circuit breaker's half-open probe."""
     global _ticket_next, _request_times
     deadline = time.time() + MAX_QUEUE_WAIT
     async with _slot_cond:
@@ -190,10 +270,18 @@ async def _acquire_slot(should_abandon=None, label: str = "") -> None:
                 if head:
                     _request_times = [t for t in _request_times if now - t < 60]
                     if len(_request_times) < RATE_LIMIT:
-                        _request_times.append(now)
-                        _advance_queue()
-                        return
-                    wait = 60 - (now - _request_times[0]) + 0.05
+                        # Checked only once a slot is free, so an open breaker never spends
+                        # quota and a queued call isn't rejected while it still has to wait.
+                        probe = _breaker_gate(label)
+                        if probe is not None:
+                            _request_times.append(now)
+                            _advance_queue()
+                            return probe
+                    else:
+                        wait = 60 - (now - _request_times[0]) + 0.05
+                        # Don't wait for a slot only to be refused by the breaker then.
+                        if _breaker_rejects() and now + wait < _breaker_open_until:
+                            raise _breaker_open_error()
                 if (now + wait if head else now) > deadline:
                     raise HTTPException(status_code=503, detail="Data provider rate limit busy — retry shortly")
                 if should_abandon is not None and await should_abandon():
@@ -245,8 +333,17 @@ async def rate_limited_get(
             raise HTTPException(status_code=status, detail=detail)
         del _denied[family]
 
+    # This exact call failed at the provider moments ago: replay that error for free.
+    failed = _provider_failed.get(cache_key)
+    if failed is not None:
+        status, detail = failed
+        raise HTTPException(status_code=status, detail=detail)
+
     flight = _inflight.get(cache_key)
     if flight is None:
+        # Joining an existing flight above is free, so only new upstream calls are refused.
+        if _breaker_rejects():
+            raise _breaker_open_error()
         flight = _Inflight()
         _inflight[cache_key] = flight
         # Fresh context: the shared task must not belong to whichever request started it.
@@ -275,71 +372,113 @@ def _is_auth_failure(resp: httpx.Response) -> bool:
     return isinstance(error, str) and "unknown api key" in error.lower()
 
 
+def _provider_failure(cache_key: str, label: str, status: int, detail: str, reason: str,
+                      probe: bool) -> HTTPException:
+    """Record a 502/504-class provider failure (negative cache + breaker) and build its error.
+    Only our short `detail` is stored and replayed, never Polygon's body."""
+    _provider_failed[cache_key] = (status, detail)
+    _breaker_failure(label, reason, probe)
+    return HTTPException(status_code=status, detail=detail)
+
+
 async def _fetch_upstream(
     url: str, params: Optional[dict], family: Optional[str],
     store: TTLCache, cache_key: str, flight: _Inflight,
 ) -> dict:
-    global _request_times, _auth_error_at
-    full_params = {"apiKey": API_KEY, **(params or {})}
+    global _breaker_probing
     label = url.replace(BASE_URL, "")
+    is_probe = False
+    try:
+        for attempt in range(2):
+            is_probe = await _acquire_slot(flight.all_clients_gone, label) or is_probe
+            resp = await _send_upstream(url, params, cache_key, label, is_probe)
+            if resp.status_code == 429 and attempt == 0:
+                # Polygon's window is fuller than our count (e.g. after a restart): treat it
+                # as full. A 429 means Polygon is answering, so it never trips the breaker.
+                logger.warning("Polygon returned 429 for %s; backing off", label)
+                _breaker_success(label, 429)
+                _rate_window_full()
+                continue
+            break
+        return _handle_upstream_response(resp, family, store, cache_key, label, is_probe)
+    finally:
+        # A probe that ended without a verdict (e.g. cancelled at shutdown) must not leave the
+        # breaker waiting forever: the next call to reach the queue head probes instead.
+        if is_probe and _breaker_probing and _breaker_open_until is not None:
+            _breaker_probing = False
 
-    for attempt in range(2):
-        await _acquire_slot(flight.all_clients_gone, label)
-        # Network failures become clean 504/502s (not raw 500s). This shared task raises, so
-        # every coalesced waiter gets the same error, and nothing is cached. Log `label`
-        # rather than the exception text, which can include the request URL with the API key.
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, params=full_params)
-        except httpx.TimeoutException as e:
-            logger.warning("Polygon request timed out for %s (%s)", label, type(e).__name__)
-            raise HTTPException(status_code=504, detail="Data provider timed out — retry shortly")
-        except httpx.RequestError as e:
-            logger.warning("Polygon request failed for %s (%s)", label, type(e).__name__)
-            raise HTTPException(status_code=502, detail="Data provider unreachable — retry shortly")
-        if resp.status_code == 429 and attempt == 0:
-            # Polygon's window is fuller than our count (e.g. after a restart): treat it as full.
-            logger.warning("Polygon returned 429 for %s; backing off", label)
-            _request_times = [time.time()] * RATE_LIMIT
-            continue
-        break
 
-    if resp.status_code == 429:
+def _rate_window_full() -> None:
+    global _request_times
+    _request_times = [time.time()] * RATE_LIMIT
+
+
+async def _send_upstream(url: str, params: Optional[dict], cache_key: str, label: str,
+                         is_probe: bool) -> httpx.Response:
+    # Network failures become clean 504/502s (not raw 500s). The shared task raises, so every
+    # coalesced waiter gets the same error, and nothing goes in the success caches. Log `label`
+    # rather than the exception text, which can include the request URL with the API key.
+    full_params = {"apiKey": API_KEY, **(params or {})}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await client.get(url, params=full_params)
+    except httpx.TimeoutException as e:
+        logger.warning("Polygon request timed out for %s (%s)", label, type(e).__name__)
+        raise _provider_failure(cache_key, label, 504, "Data provider timed out — retry shortly",
+                                "timeout", is_probe)
+    except httpx.RequestError as e:
+        logger.warning("Polygon request failed for %s (%s)", label, type(e).__name__)
+        raise _provider_failure(cache_key, label, 502, "Data provider unreachable — retry shortly",
+                                type(e).__name__, is_probe)
+
+
+def _handle_upstream_response(
+    resp: httpx.Response, family: Optional[str], store: TTLCache, cache_key: str, label: str,
+    is_probe: bool,
+) -> dict:
+    global _auth_error_at
+    status = resp.status_code
+    if 400 <= status < 500:
+        # Polygon answered: the provider is up, whatever the 4xx means for this call.
+        _breaker_success(label, status)
+    if status == 429:
         raise HTTPException(status_code=503, detail="Data provider rate limit busy — retry shortly")
     if _is_auth_failure(resp):
         # Bad/revoked/missing key: affects every family, so it is not memoised as a denial.
         # Replace Polygon's body with an actionable message (the body never holds the key,
-        # but this keeps panels readable).
+        # but this keeps panels readable). Some auth failures arrive as non-4xx statuses;
+        # Polygon still answered, so they also count as the provider being up.
+        _breaker_success(label, status)
         if _auth_error_at is None:
             logger.error("Polygon rejected the API key (401) for %s", label)
         _auth_error_at = time.time()
         raise HTTPException(status_code=401, detail=AUTH_ERROR_DETAIL)
-    if resp.status_code in (403, 410):
+    if status in (403, 410):
         # Plan denial / deprecation: endpoints in a degrading family inspect the status
         # (`_is_denied`) and fall back; the rest propagate it. Either way the client sees our
         # short message, never Polygon's body; log status + path only (as below).
-        detail = DENIAL_DETAIL[resp.status_code]
-        logger.warning("Polygon returned HTTP %s for %s", resp.status_code, label)
+        detail = DENIAL_DETAIL[status]
+        logger.warning("Polygon returned HTTP %s for %s", status, label)
         if family:
-            denial_ttl = DENIAL_TTL[resp.status_code]
-            _denied[family] = (time.time() + denial_ttl, resp.status_code, detail)
+            denial_ttl = DENIAL_TTL[status]
+            _denied[family] = (time.time() + denial_ttl, status, detail)
             if family == "snapshot":
                 _record_mode("eod")
-            logger.warning("Polygon denied %s (%s); skipping for %ss", family, resp.status_code, denial_ttl)
-        raise HTTPException(status_code=resp.status_code, detail=detail)
-    if resp.status_code != 200:
+            logger.warning("Polygon denied %s (%s); skipping for %ss", family, status, denial_ttl)
+        raise HTTPException(status_code=status, detail=detail)
+    if status != 200:
         # Anything else unexpected (5xx, 404 for an unknown symbol, ...): replace Polygon's raw
         # body with a short message. Log only the status and path — never the body or the full
         # URL (its query string holds the API key). Not cached. 4xx keep their status (not
         # retried by the panels); upstream 5xx and non-error statuses (e.g. an unfollowed 3xx)
-        # become 502 so the panels' bounded retry kicks in. Our own 503 (rate-limit queue) and
-        # 504 (timeout) are raised elsewhere and are unaffected.
-        logger.warning("Polygon returned HTTP %s for %s", resp.status_code, label)
-        if 400 <= resp.status_code < 500:
-            raise HTTPException(status_code=resp.status_code, detail=f"Data provider error (HTTP {resp.status_code})")
-        raise HTTPException(
-            status_code=502, detail=f"Data provider error (HTTP {resp.status_code}) — retry shortly"
-        )
+        # become 502 so the panels' bounded retry kicks in — and count as provider failures
+        # (negative cache + breaker). Our own 503 (rate-limit queue) and 504 (timeout) are
+        # raised elsewhere.
+        logger.warning("Polygon returned HTTP %s for %s", status, label)
+        if 400 <= status < 500:
+            raise HTTPException(status_code=status, detail=f"Data provider error (HTTP {status})")
+        raise _provider_failure(cache_key, label, 502, f"Data provider error (HTTP {status}) — retry shortly",
+                                f"HTTP {status}", is_probe)
 
     _auth_error_at = None  # any successful upstream response proves the key works
 
@@ -347,7 +486,9 @@ async def _fetch_upstream(
         data = resp.json()
     except ValueError:
         logger.warning("Polygon returned invalid JSON for %s", label)
-        raise HTTPException(status_code=502, detail="Data provider sent an invalid response — retry shortly")
+        raise _provider_failure(cache_key, label, 502, "Data provider sent an invalid response — retry shortly",
+                                "invalid JSON", is_probe)
+    _breaker_success(label, status)
     store[cache_key] = data
     if family == "snapshot":
         _record_mode("live")
@@ -379,6 +520,8 @@ async def health():
         "data": _data_mode(),
         # When the live/eod evidence was last observed (may predate a restart); null if none.
         "data_as_of": datetime.utcfromtimestamp(observed).isoformat() if observed else None,
+        # "degraded" while the provider circuit breaker is open or probing (local state only).
+        "provider": "ok" if _breaker_open_until is None else "degraded",
     }
 
 

@@ -31,10 +31,10 @@ flowchart LR
 In plain text:
 
 ```text
-browser ──/api/quote/AAPL──▶ vite :5173 ──proxy──▶ FastAPI ──▶ [TTL cache] ──miss──▶ [denial memo]
-                                                                      │                  │
-                                                                      ▼                  ▼
-                                                          [in-flight coalescing] ─▶ [FIFO rate-limit queue] ─▶ api.polygon.io
+browser ──/api/quote/AAPL──▶ vite :5173 ──proxy──▶ FastAPI ──▶ [TTL cache] ──miss──▶ [denial memo] ──▶ [negative cache]
+                                                                                                          │
+                                                                                                          ▼
+                       api.polygon.io ◀── [FIFO rate-limit queue + breaker gate] ◀── [breaker fast-fail] ◀── [in-flight coalescing]
 ```
 
 1. The frontend calls relative URLs such as `/api/quote/AAPL` (`frontend/src/api.js` uses axios with `baseURL: ''`). Because the call is same-origin, CORS doesn't apply.
@@ -62,7 +62,7 @@ Each call names a TTL. Responses are stored in a `cachetools.TTLCache` dedicated
 
 A separate `eod_cache` (600 s, 1024 entries) holds the assembled whole-market EOD table and single-ticker EOD quotes.
 
-Errors are never cached here. Only HTTP 200 bodies are stored.
+Errors are never cached here. Only HTTP 200 bodies are stored. (Provider failures have their own short-lived negative cache, stage 2b below, which stores only our status and message.)
 
 ### 2. Denial memo
 
@@ -76,6 +76,22 @@ Some calls are tagged with a `family` (`snapshot`, `options` or `financials`). W
 While a denial is remembered, calls in that family fail at once with the same status and cost no quota. The memo stores the short client-facing message from `DENIAL_DETAIL` ("Data provider: not included in the current data plan (HTTP 403)" / "Data provider endpoint deprecated or temporarily unavailable (HTTP 410)"), never Polygon's body. Endpoints catch these failures (`_is_denied`: 403/410) and degrade: quotes switch to EOD, and options and financials return an `error` string.
 
 A **401** (Polygon rejected the key) is handled differently, because it affects every family and every fallback would fail the same way. `_is_auth_failure` spots it (a 401, or another status whose body says `"Unknown API Key"`, which is how `vX/reference/financials` answers). The backend sets `_auth_error_at`, raises a 401 with an actionable `detail` instead of Polygon's body, and adds **nothing** to the denial memo, so once the key is fixed and the service restarted, requests go straight upstream. `_is_denied` excludes 401, so no slot is wasted on an EOD fallback that would also fail. Any 200 from Polygon clears `_auth_error_at`.
+
+### 2b. Negative cache and circuit breaker (provider failures)
+
+A **provider failure** is the 502/504 class: a timeout (504), an unreachable host (502), an upstream 5xx or unfollowed 3xx (mapped to 502), or a 200 whose body isn't valid JSON (502). Every retry of one used to be a fresh upstream call, so during a Polygon incident the panels' automatic retries could spend most of the free tier's 5 requests a minute. Two layers stop that, and both act before any quota is spent:
+
+- **Negative cache** (`_provider_failed`, a `TTLCache` of 1024 entries, `NEGATIVE_TTL = 20` s). When a call fails at the provider, its cache key (the same URL + parameters key as the success caches) is stored with the status and our short `detail`, never Polygon's body. For the next 20 s the same call gets that error straight away, with no upstream call. `/api/financials` and `/api/earnings` share a key, so they share the entry too.
+- **Circuit breaker** (global; `BREAKER_THRESHOLD = 3`, `BREAKER_COOLDOWN = 20` s). Each provider failure adds to a count of consecutive failures; any non-failure answer from Polygon resets it. At 3 the breaker **opens**: for 20 s every *new* upstream call fails fast with **503** `"Data provider having issues — retry shortly"` and a `Retry-After` header. The check runs in three places: before a new call is queued (`_breaker_rejects` in `rate_limited_get`), at the head of the queue before a slot is taken (`_breaker_gate` in `_acquire_slot`), and for a head that is waiting for a slot and would still find the breaker open when the slot frees. So a call that queued before the breaker opened leaves without spending a slot.
+- **Half-open probe.** After the cooldown, the next call to reach the head of the queue becomes the single probe (`_breaker_probing`). Calls behind it wait in the queue (they keep their place, and the 75 s ceiling and abandonment still apply) instead of failing. If the probe gets any answer that isn't a provider failure, the breaker **closes**, the negative cache is cleared (those entries belonged to the same incident) and the waiters go upstream normally. If the probe fails, the breaker re-opens for another 20 s and the waiters get the 503 without spending quota. A probe that ends without a verdict (for example cancelled at shutdown) releases the probe flag, so the next call probes instead.
+- **What never counts as a failure:** any 4xx answer from Polygon, which includes 401 (auth error), 403/410 (denial memo), 404 and 429 (429 backoff). These mean Polygon is answering, so they reset the count, and a straggler's success while the breaker is open closes it. Our own 503 (rate-limit queue) and 499 (abandoned) never reach the breaker, because no upstream response is involved.
+- **Composition.** The order in `rate_limited_get` is: success cache → denial memo → negative cache → join an identical in-flight call (always allowed, because it costs nothing, even while the breaker is open) → breaker fast-fail → new coalesced call → FIFO queue with the breaker gate. A coalesced failure counts once and is replayed to every waiter. The data-mode and auth tracking are unchanged: a provider failure says nothing about the key or the plan.
+- **Logging.** Transitions are logged at WARNING with a status or exception class and a path only: `Provider circuit breaker OPEN after 3 consecutive failures (last: HTTP 500 for /v2/reference/news); failing fast for 20s`, `... HALF-OPEN: probing with <path>`, `... OPEN: probe failed (<reason> for <path>); ...` and `... CLOSED: provider answered HTTP <status> for <path>`. Bodies and URLs with the key are never logged.
+- **`/api/health`** reports `"provider": "degraded"` while the breaker is open or probing, and `"ok"` otherwise. It reads local state only.
+
+**Upstream cost during an outage.** One key costs at most one upstream call per 20 s window. Across the whole app, a sustained outage costs the 3 failures that open the breaker, then one probe per 20 s cooldown (at most 3 a minute, and only when something is asking). In the mocked test (7 endpoints polled every 2 s for 2 minutes, 420 client calls), 8 upstream calls went out.
+
+**Why 20 s for both windows.** They match the frontend's final retry, which comes about 21 s after the first failure (3 s, 6 s and 12 s backoff, below). Attempts 2 and 3 are free replays, and the last attempt lands just after both windows, so it is a real retry, or it waits behind the probe, instead of being a replay of a stale error. A longer cooldown would make the last retry always fail during a brief blip. A shorter one would spend more quota on probes in a long outage.
 
 ### 3. In-flight coalescing
 
@@ -95,13 +111,13 @@ This matters because every open browser tab polls `/api/quote/{ticker}` every 2 
 
 If Polygon still answers 429, for example because a restart wiped the local window count, the backend treats its window as full (`_request_times = [now] * RATE_LIMIT`) and retries once through the queue. A second 429 becomes a 503.
 
-Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing is cached. The slot the attempt used still counts against the minute.
+Upstream requests use `httpx` with a 15 s timeout. A timeout becomes **504** "Data provider timed out — retry shortly". Any other `httpx` request error (connection refused, DNS, TLS, dropped connection), or a 200 response whose body isn't valid JSON, becomes **502**. Both log a warning that names the endpoint path but not the query string, which holds the API key. The shared coalesced task raises the error, so every waiter gets the same one, and nothing goes in the success caches. The slot the attempt used still counts against the minute, but the negative cache and circuit breaker (stage 2b) stop retries from spending more.
 
 A 403/410 keeps its status (endpoints in a degrading family inspect it with `_is_denied`), but its `detail` is the fixed `DENIAL_DETAIL` message, so endpoints outside those families (search, aggs, news, ticker-details, the EOD fallback's bar calls) never pass Polygon's body to the client.
 
-Any other non-200 answer that isn't a 429 or an auth failure gets `detail` `"Data provider error (HTTP <status>)"`. A 4xx (for example 404 for an unknown symbol) keeps its status and is not retried by the frontend. A 5xx (500–599), or a non-error status such as an unfollowed 3xx, becomes **502** with " — retry shortly" appended and the original status in the message, so the panels' bounded retry applies. Our own 503 (rate-limit queue) and 504 (timeout) are raised earlier and are unaffected.
+Any other non-200 answer that isn't a 429 or an auth failure gets `detail` `"Data provider error (HTTP <status>)"`. A 4xx (for example 404 for an unknown symbol) keeps its status and is not retried by the frontend. A 5xx (500–599), or a non-error status such as an unfollowed 3xx, becomes **502** with " — retry shortly" appended and the original status in the message, so the panels' bounded retry applies. It is also a provider failure for the negative cache and breaker. Our own 503 (rate-limit queue) and 504 (timeout) are raised earlier and are unaffected.
 
-For all of these the backend logs `Polygon returned HTTP <status> for <path>` (status and path only, never the body or the query string, which holds the API key), and nothing is cached. The order matters: `_is_auth_failure` reads the body first (to catch `"Unknown API Key"`), before any of this replaces it.
+For all of these the backend logs `Polygon returned HTTP <status> for <path>` (status and path only, never the body or the query string, which holds the API key), and nothing goes in the success caches. The order matters: `_is_auth_failure` reads the body first (to catch `"Unknown API Key"`), before any of this replaces it.
 
 ### 6. Data mode (`/api/health`)
 
@@ -135,8 +151,8 @@ The free tier isn't entitled to `/v2/snapshot/...`. When a snapshot call is deni
 - **Parallel loading:** selecting a ticker fires news, chart, ticker details, financials, options and earnings at once. The quote loads alongside them. The backend queue does the pacing. News is fired first so it gets the earliest slot.
 - **Abort on ticker switch:** each ticker gets an `AbortController`. Switching tickers aborts the previous one's requests, including its in-flight quote (first load or poll), which lets the backend drop them from its queue (the 499 path). Responses for a ticker the user has already left are also ignored, so a slow quote for the old ticker can't briefly show its price, loading state or error under the new one.
 - **Abort on timeframe change:** the chart has its own `AbortController`. Each chart load aborts the previous one, and the ticker's controller aborts it too. Bars are applied only if the response belongs to the newest load and still matches the current ticker and timeframe, so a slow older timeframe can't overwrite a newer one.
-- **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, 3 s apart, and the panel stays in LOADING meanwhile. That covers upstream 5xx, which the backend maps to 502. Other errors (401, 403, 404, 410) show at once.
-- **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab.
+- **Retry on transient errors:** `withBusyRetry` retries 502, 503 and 504 up to 4 attempts in total, with backoff: it waits 3 s, 6 s and then 12 s (`RETRY_DELAYS_MS`), so the attempts go out about 0, 3, 9 and 21 s after the first failure. The panel stays in LOADING meanwhile. This covers upstream 5xx (mapped to 502), timeouts (504), the rate-limit queue (503) and the open circuit breaker (503). The spacing is set by the backend's 20 s negative-cache and breaker windows (stage 2b): attempts 2 and 3 cost no quota, and the last one is a real retry. A ticker switch aborts the retries, including a pending wait. Other errors (401, 403, 404, 410) show at once.
+- **Reasons, not blanks:** if a response has an `error` field (for example the options add-on message), or a request fails, the panel shows that text instead of a bare "NO DATA". This includes the EARNINGS tab, and the QUOTE panel's COMPANY section: a `/api/ticker-details` failure (`panelErrors.details`) replaces the four COMPANY rows with the message in amber, while the price and session data from `/api/quote` (which loads on its own) stay visible.
 - **Error text:** every panel, including the MONITOR tabs (`MonitorPanel.jsx`), turns a failed request into text with `errorText()` in `frontend/src/lib/errors.js`: the backend's `detail` when it is a plain message, otherwise `REQUEST FAILED` (never a raw JSON body, HTML/markup starting with `<`, a string over 200 characters, a validation array or an empty value). This is defence in depth: the backend already replaces upstream bodies with short messages. The MONITOR tabs keep showing their last good data when a later poll fails, and show the error only while they have no data; the next interval simply polls again.
 - **Polling cadence:**
 
@@ -158,7 +174,7 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 
 ## State and persistence
 
-- The backend keeps all state in process memory: caches, the denial memo, the rate-limit window and the queue. Restarting `bbg-api` clears all of it. There is no database.
+- The backend keeps all state in process memory: caches, the denial memo, the negative cache, the circuit breaker, the rate-limit window and the queue. Restarting `bbg-api` clears all of it. There is no database.
 - The frontend stores the watchlist (`bbg.watchlist`, at most 50 symbols; longer saved lists are trimmed on load) and portfolio holdings (`bbg.portfolio`, as exact decimal strings) in `localStorage`. Portfolio valuation is a pure client-side calculation in `frontend/src/lib/portfolio.js`. The method is described in [DATA-SOURCES.md](DATA-SOURCES.md#portfolio-pl-methodology).
 
 ## Time zones
@@ -173,6 +189,5 @@ A ticker switch on the free tier typically needs these upstream requests: news (
 - `/api/watchlist` quietly drops symbols that fail its pattern and caps the list at 50. The WATCH tab enforces the same cap (`MAX_WATCHLIST` in `backend/main.py`, mirrored in `frontend/src/lib/limits.js`), so the two must be changed together.
 - The `updated` field uses different units by source: EOD rows carry the bar's epoch milliseconds, while live rows pass Polygon's snapshot `updated` through unchanged (nanoseconds in Polygon's snapshot format). The UI doesn't read it.
 - On the free tier, the 1D chart covers yesterday and today in UTC, so it can be empty on weekends and early on Mondays.
-- A ticker-details failure has no visible message: `panelErrors.details` is set but not rendered, so the QUOTE panel's COMPANY rows just stay `---`.
-- Each automatic retry of a 502 (including a mapped upstream 5xx) is a fresh upstream call and uses a rate-limit slot, so during a provider incident one panel can spend up to 4 of the 5 free-tier requests per minute.
 - The docstring of `_macro_events` says "next 12 months", but the code returns −90 to +180 days.
+- The circuit breaker is global, so a partial outage (one endpoint failing while others work) doesn't open it, because the successes keep resetting the count. That endpoint is limited only by the negative cache, to one upstream call per key per 20 s. The breaker state is in memory only and starts closed after a restart.

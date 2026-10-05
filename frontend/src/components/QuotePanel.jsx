@@ -31,7 +31,7 @@ function Divider({ label }) {
   );
 }
 
-export default function QuotePanel({ quote, details, loading, error }) {
+export default function QuotePanel({ quote, details, loading, error, detailsError }) {
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)' }}>
       LOADING...
@@ -111,10 +111,19 @@ export default function QuotePanel({ quote, details, loading, error }) {
       <Row label="VOLUME" value={fmtK(quote.volume)} />
 
       <Divider label="COMPANY" />
-      <Row label="MKT CAP" value={fmtK(details?.market_cap)} />
-      <Row label="SHARES OUT" value={fmtK(details?.weighted_shares_outstanding)} />
-      <Row label="SECTOR" value={details?.sic_description?.slice(0, 20) || '---'} />
-      <Row label="LISTED" value={details?.list_date || '---'} />
+      {/* Ticker details load independently of the quote: a failure only replaces this section. */}
+      {!details && detailsError ? (
+        <div style={{ padding: '8px', color: 'var(--amber-dim)', fontSize: '11px', textAlign: 'center', textTransform: 'uppercase' }}>
+          {detailsError}
+        </div>
+      ) : (
+        <>
+          <Row label="MKT CAP" value={fmtK(details?.market_cap)} />
+          <Row label="SHARES OUT" value={fmtK(details?.weighted_shares_outstanding)} />
+          <Row label="SECTOR" value={details?.sic_description?.slice(0, 20) || '---'} />
+          <Row label="LISTED" value={details?.list_date || '---'} />
+        </>
+      )}
     </div>
   );
 }

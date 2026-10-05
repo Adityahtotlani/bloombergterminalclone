@@ -14,18 +14,24 @@ import './App.css';
 const DATA_MODES = new Set(['live', 'eod', 'auth_error']);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Transient backend answers worth retrying: rate-limit queue full (503), provider
-// unreachable (502) or timed out (504). A 401 (API key rejected) is never retried.
+// Transient backend answers worth retrying: rate-limit queue full or provider circuit
+// breaker open (503), provider unreachable / upstream 5xx (502) or timed out (504).
+// A 401 (API key rejected) is never retried.
 const RETRY_STATUSES = new Set([502, 503, 504]);
+// Waits before attempts 2, 3 and 4 (4 attempts in total). Backing off puts the last attempt
+// ~21 s after the first failure — just past the backend's 20 s negative cache and circuit
+// breaker cooldown — so attempts 2–3 cost no quota (the backend replays the error) and the
+// last one is a real retry (or waits behind the breaker's probe) rather than a replay.
+const RETRY_DELAYS_MS = [3000, 6000, 12000];
 
 /** Retry transient failures a bounded number of times — the panel stays in LOADING. */
-async function withBusyRetry(fn, signal, attempts = 4) {
+async function withBusyRetry(fn, signal, delays = RETRY_DELAYS_MS) {
   for (let i = 0; ; i++) {
     try {
       return await fn();
     } catch (e) {
-      if (signal?.aborted || !RETRY_STATUSES.has(e?.response?.status) || i >= attempts - 1) throw e;
-      await sleep(3000);
+      if (signal?.aborted || !RETRY_STATUSES.has(e?.response?.status) || i >= delays.length) throw e;
+      await sleep(delays[i]);
       if (signal?.aborted) throw e;
     }
   }
@@ -267,7 +273,13 @@ export default function App() {
         <Panel style={{ width: '220px', flexShrink: 0 }}>
           <PanelHeader label="QUOTE" />
           <div style={{ flex: 1, overflow: 'hidden' }}>
-            <QuotePanel quote={quote} details={details} loading={loadingQuote} error={panelErrors.quote} />
+            <QuotePanel
+              quote={quote}
+              details={details}
+              loading={loadingQuote}
+              error={panelErrors.quote}
+              detailsError={panelErrors.details}
+            />
           </div>
         </Panel>
 
